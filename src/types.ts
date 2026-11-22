@@ -26,8 +26,11 @@ export interface LeadJobState {
   costEstimateUsd?: number;
   tokenCount?: number;
   candidateCount?: number;
+  candidateMissingCount?: number;
   suppressedCount?: number;
   cancelRequested?: boolean;
+  inputDeleted?: boolean;
+  outputDeleted?: boolean;
   createdAt: string;
   updatedAt: string;
   error?: string;

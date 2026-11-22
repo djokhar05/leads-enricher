@@ -68,5 +68,25 @@ export const config = {
   finderAuthToken: process.env.LEAD_FINDER_AUTH_TOKEN?.trim() || "",
   llmBaseUrl: process.env.LEAD_LLM_BASE_URL?.trim() || "",
   llmApiKey: process.env.LEAD_LLM_API_KEY?.trim() || "",
-  llmModel: process.env.LEAD_LLM_MODEL?.trim() || "",
+  llmModel:
+    process.env.LEAD_LLM_MODEL?.trim() || "gemini-3.5-flash-lite",
+  llmEnabled: /^(1|true|yes|on)$/i.test(
+    process.env.LEAD_LLM_ENABLED || "false",
+  ),
+  llmProvider: (
+    process.env.LEAD_LLM_PROVIDER?.trim().toLowerCase() || "gemini"
+  ) as "gemini" | "openai",
+  llmFallbackProvider: (
+    process.env.LEAD_LLM_FALLBACK_PROVIDER?.trim().toLowerCase() || "openai"
+  ) as "gemini" | "openai",
+  llmFallbackModel:
+    process.env.LEAD_LLM_FALLBACK_MODEL?.trim() || "gpt-6-luna",
+  llmFallbackApiKey:
+    process.env.LEAD_LLM_FALLBACK_API_KEY?.trim() || "",
+  llmFallbackBaseUrl:
+    process.env.LEAD_LLM_FALLBACK_BASE_URL?.trim() ||
+    "https://api.openai.com/v1",
+  llmWebsiteResearchEnabled: /^(1|true|yes|on)$/i.test(
+    process.env.LEAD_LLM_WEBSITE_RESEARCH_ENABLED || "true",
+  ),
 };

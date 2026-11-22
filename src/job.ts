@@ -13,6 +13,8 @@ import { isSuppressed } from "./suppressions";
 import { setDomainCache } from "./domain-cache";
 import { appendAudit } from "./audit";
 import { config } from "./config";
+import { enrichWithLlm } from "./provider-adapters";
+import { researchCompanyDomain } from "./website-research";
 
 // Configuration for a single local CSV enrichment run.
 export interface StartLeadJobOptions {
@@ -29,6 +31,8 @@ export interface StartLeadJobOptions {
   firstNameColumn?: string;
   lastNameColumn?: string;
   domainColumn?: string;
+  llmEnabled?: boolean;
+  websiteResearchEnabled?: boolean;
   initialState?: LeadJobState;
   cancelRequested?: () => boolean;
 }
@@ -116,6 +120,77 @@ export const runLeadJob = async (
   const emitBatch = async (
     batch: LeadRow[],
   ): Promise<void> => {
+    if (options.llmEnabled) {
+      for (const lead of batch) {
+        if ((lead.rankedCandidates || []).length > 0) continue;
+        const domain =
+          options.domainColumn
+            ? String(lead.source[options.domainColumn] || "").trim()
+            : "";
+        if (!domain) continue;
+        const research =
+          (options.websiteResearchEnabled ?? true)
+            ? await researchCompanyDomain(domain)
+            : null;
+        const discovered = await enrichWithLlm({
+          domain,
+          companyName: research?.title,
+          sourceUrl: research?.url,
+          sourceText: research?.text,
+        });
+        if (!discovered) continue;
+        state.tokenCount =
+          (state.tokenCount || 0) + discovered.tokenCount;
+        state.costEstimateUsd =
+          (state.costEstimateUsd || 0) +
+          discovered.costEstimateUsd;
+        for (const fullName of discovered.names) {
+          const parts = fullName
+            .trim()
+            .split(/\s+/)
+            .filter(Boolean);
+          if (parts.length < 2) continue;
+          const firstName = parts[0];
+          const lastName = parts.slice(1).join(" ");
+          const aiRecord = {
+            ...lead.source,
+            ...(options.firstNameColumn
+              ? { [options.firstNameColumn]: firstName }
+              : {}),
+            ...(options.lastNameColumn
+              ? { [options.lastNameColumn]: lastName }
+              : {}),
+            ...(options.domainColumn
+              ? { [options.domainColumn]: domain }
+              : {}),
+          };
+          const ranked = rankedCandidateEmails(
+            aiRecord,
+            options.emailColumn,
+            options.firstNameColumn,
+            options.lastNameColumn,
+            options.domainColumn,
+          ).map((candidate) =>
+            candidate.provenance.startsWith("candidate-pattern")
+              ? {
+                  ...candidate,
+                  score: Math.max(candidate.score - 5, 20),
+                  provenance: `ai+${candidate.provenance}`,
+                }
+              : candidate,
+          );
+          if (ranked.length > 0) {
+            lead.rankedCandidates = ranked;
+            lead.candidateEmail = ranked[0].email;
+            lead.provenance = [
+              ...lead.provenance,
+              research ? `llm:${research.url}` : "llm:explicit-source",
+            ];
+            break;
+          }
+        }
+      }
+    }
     // A row with no candidate is retained but explicitly marked not verified.
     // The addresses below, rather than the source rows, determine provider calls.
     // Only candidate addresses consume the verifier/provider budget.
@@ -218,6 +293,8 @@ export const runLeadJob = async (
     // Batch state is held locally instead of the entire file. This limits peak memory
     // while still preserving original row order in the output.
     let batch: LeadRow[] = [];
+    let candidateGeneratedCount = 0;
+    let candidateMissingCount = 0;
     // csv-parse streams records instead of loading the entire CSV into memory.
     for await (const record of parser as AsyncIterable<Record<string, string>>) {
       rowNumber += 1;
@@ -248,6 +325,8 @@ export const runLeadJob = async (
       const suppressed = rankedCandidates.some((candidate) =>
         isSuppressed(candidate.email),
       );
+      if (rankedCandidates.length > 0) candidateGeneratedCount += 1;
+      else candidateMissingCount += 1;
       batch.push({
         rowId: stableRowId(record, rowNumber),
         source: { ...record },
@@ -282,6 +361,15 @@ export const runLeadJob = async (
         state.processedRows = rowNumber;
         state.checkpointRow = rowNumber;
         state.totalRows = rowNumber;
+        state.candidateCount = candidateGeneratedCount;
+        state.candidateMissingCount = candidateMissingCount;
+        state.suppressedCount =
+          (state.suppressedCount || 0) +
+          batch.filter((lead) =>
+            lead.rankedCandidates?.some((candidate) =>
+              isSuppressed(candidate.email),
+            ),
+          ).length;
         state = saveJobState(options.stateDir, state);
       }
     }

@@ -119,6 +119,16 @@ app.get("/health", async (_req, res) => {
     disk: diskUsage(outputDir),
     diskMinimumBytes: config.minFreeDiskBytes,
     auditEntries: loadAuditEntries(20),
+    ai: {
+      enabled: config.llmEnabled,
+      provider: config.llmProvider,
+      model: config.llmModel,
+      fallbackProvider: config.llmFallbackProvider,
+      fallbackModel: config.llmFallbackModel,
+      websiteResearchEnabled: config.llmWebsiteResearchEnabled,
+      primaryKeyConfigured: Boolean(config.llmApiKey),
+      fallbackKeyConfigured: Boolean(config.llmFallbackApiKey),
+    },
     verifier,
   });
 });
@@ -165,6 +175,8 @@ app.post("/jobs", (req, res) => {
     firstNameColumn?: string;
     lastNameColumn?: string;
     domainColumn?: string;
+    llmEnabled?: boolean;
+    websiteResearchEnabled?: boolean;
   };
   if (!body.inputPath) {
     res.status(400).json({ error: "inputPath is required" });
@@ -267,6 +279,14 @@ app.post("/jobs", (req, res) => {
     firstNameColumn: body.firstNameColumn,
     lastNameColumn: body.lastNameColumn,
     domainColumn: body.domainColumn,
+    llmEnabled:
+      typeof body.llmEnabled === "boolean"
+        ? body.llmEnabled
+        : config.llmEnabled,
+    websiteResearchEnabled:
+      typeof body.websiteResearchEnabled === "boolean"
+        ? body.websiteResearchEnabled
+        : config.llmWebsiteResearchEnabled,
     initialState: initial,
     cancelRequested: () => cancellationRequested.has(id),
   }).finally(() => {
@@ -303,6 +323,81 @@ app.get("/files", (_req, res) => {
     inputs: listDirectory(inputDir),
     outputs: listDirectory(outputDir),
   });
+});
+
+app.delete("/files", (req, res) => {
+  const requestedPath =
+    typeof req.body?.path === "string" ? req.body.path : "";
+  if (!requestedPath) {
+    res.status(400).json({ error: "File path is required" });
+    return;
+  }
+
+  let resolvedPath: string;
+  try {
+    const absolute = path.resolve(requestedPath);
+    const relativeToInput = path.relative(path.resolve(inputDir), absolute);
+    const relativeToOutput = path.relative(path.resolve(outputDir), absolute);
+    const insideInput =
+      relativeToInput === "" ||
+      (!relativeToInput.startsWith("..") && !path.isAbsolute(relativeToInput));
+    const insideOutput =
+      relativeToOutput === "" ||
+      (!relativeToOutput.startsWith("..") && !path.isAbsolute(relativeToOutput));
+    if (!insideInput && !insideOutput) {
+      res.status(400).json({
+        error: "File is outside the configured input/output directories",
+      });
+      return;
+    }
+    resolvedPath = absolute;
+  } catch {
+    res.status(400).json({ error: "Invalid file path" });
+    return;
+  }
+
+  if (!fs.existsSync(resolvedPath) || !fs.statSync(resolvedPath).isFile()) {
+    res.status(404).json({ error: "File not found" });
+    return;
+  }
+
+  const activeJobs = loadJobStates(stateDir).filter((job) =>
+    ["queued", "processing", "paused"].includes(job.status),
+  );
+  const referencedByActiveJob = activeJobs.some(
+    (job) =>
+      path.resolve(job.inputPath) === resolvedPath ||
+      path.resolve(job.outputPath) === resolvedPath,
+  );
+  if (referencedByActiveJob) {
+    res.status(409).json({
+      error: "File belongs to an active enrichment job",
+    });
+    return;
+  }
+
+  fs.unlinkSync(resolvedPath);
+  for (const job of loadJobStates(stateDir)) {
+    let changed = false;
+    const update: typeof job = { ...job };
+    if (path.resolve(job.inputPath) === resolvedPath) {
+      update.inputDeleted = true;
+      changed = true;
+    }
+    if (path.resolve(job.outputPath) === resolvedPath) {
+      update.outputDeleted = true;
+      changed = true;
+    }
+    if (changed) saveJobState(stateDir, update);
+  }
+  appendAudit({
+    timestamp: new Date().toISOString(),
+    hostId: config.hostId,
+    action: "lead_enrichment.file.deleted",
+    status: "success",
+    metadata: { path: resolvedPath },
+  });
+  res.json({ deleted: true, path: resolvedPath });
 });
 
 app.post("/jobs/:jobId/resume", (req, res) => {
@@ -347,6 +442,8 @@ app.post("/jobs/:jobId/resume", (req, res) => {
     verifierBaseUrl,
     verifierAuthToken,
     initialState: resumed,
+    llmEnabled: config.llmEnabled,
+    websiteResearchEnabled: config.llmWebsiteResearchEnabled,
     cancelRequested: () => cancellationRequested.has(jobId),
   }).finally(() => {
     running.delete(jobId);
@@ -422,6 +519,8 @@ app.post("/jobs/:jobId/retry", (req, res) => {
     verifierBaseUrl,
     verifierAuthToken,
     initialState: retried,
+    llmEnabled: config.llmEnabled,
+    websiteResearchEnabled: config.llmWebsiteResearchEnabled,
     cancelRequested: () => cancellationRequested.has(jobId),
   }).finally(() => {
     running.delete(jobId);
@@ -540,6 +639,8 @@ if (
         verifierBaseUrl,
         verifierAuthToken,
         initialState: resumed,
+        llmEnabled: config.llmEnabled,
+        websiteResearchEnabled: config.llmWebsiteResearchEnabled,
         cancelRequested: () => cancellationRequested.has(resumed.id),
       }).finally(() => {
         running.delete(resumed.id);
@@ -598,6 +699,8 @@ if (
       firstNameColumn: argument("--first-name-column"),
       lastNameColumn: argument("--last-name-column"),
       domainColumn: argument("--domain-column"),
+      llmEnabled: config.llmEnabled,
+      websiteResearchEnabled: config.llmWebsiteResearchEnabled,
     }).then((state) => {
       console.log(JSON.stringify(state));
     });
