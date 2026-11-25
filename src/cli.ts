@@ -35,7 +35,9 @@ Job options:
   --email-column <name>      CSV column containing an existing email
   --first-name-column <name> CSV column containing first names
   --last-name-column <name>  CSV column containing last names
+  --full-name-column <name>  CSV column containing combined full names
   --domain-column <name>     CSV column containing company domains
+  --retain-missing-email     Keep rows without a candidate email in the output
 
 Information:
   -h, --help                 Show this help text

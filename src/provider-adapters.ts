@@ -16,6 +16,15 @@ export interface FinderResult {
   provenance: string;
 }
 
+export interface LlmDiagnosticResult {
+  names: string[];
+  costEstimateUsd: number;
+  tokenCount: number;
+  status: "ok" | "disabled" | "no_key" | "provider_error";
+  provider?: "gemini" | "openai";
+  error?: string;
+}
+
 export const findCandidates = async (
   input: FinderInput,
 ): Promise<FinderResult | null> => {
@@ -58,13 +67,17 @@ export const findCandidates = async (
 
 export const enrichWithLlm = async (
   input: FinderInput,
+  signal?: AbortSignal,
 ): Promise<{ names: string[]; costEstimateUsd: number; tokenCount: number } | null> => {
+  signal?.throwIfAborted();
   if (!config.llmEnabled) {
     return null;
   }
   const prompt =
-    "Extract only explicitly provided person names and source context. " +
-    "Do not infer names or fabricate facts. Return JSON: " +
+    "Extract or infer the most likely owner, founder, or CEO full name for this business. " +
+    "Use team pages, about pages, contact pages, or search snippets. " +
+    "If no name is explicitly stated, infer from context clues (e.g. 'Founded by', 'Meet our team', 'Owner'). " +
+    "Return JSON: " +
     '{"names":[{"firstName":"","lastName":"","confidence":0,"source":""}]}';
 
   const parseNames = (content: string): string[] => {
@@ -128,10 +141,12 @@ export const enrichWithLlm = async (
           generationConfig: {
             temperature: 0,
             responseMimeType: "application/json",
-            maxOutputTokens: 4096,
+            maxOutputTokens: 512,
           },
         }),
-        signal: AbortSignal.timeout(30_000),
+        signal: signal
+          ? AbortSignal.any([signal, AbortSignal.timeout(30_000)])
+          : AbortSignal.timeout(30_000),
       },
     );
     if (!response.ok) {
@@ -175,13 +190,16 @@ export const enrichWithLlm = async (
         body: JSON.stringify({
           model,
           temperature: 0,
+          max_tokens: 512,
           response_format: { type: "json_object" },
           messages: [
             { role: "system", content: prompt },
             { role: "user", content: JSON.stringify(input) },
           ],
         }),
-        signal: AbortSignal.timeout(30_000),
+        signal: signal
+          ? AbortSignal.any([signal, AbortSignal.timeout(30_000)])
+          : AbortSignal.timeout(30_000),
       },
     );
     if (!response.ok) {
@@ -223,6 +241,7 @@ export const enrichWithLlm = async (
       config.llmFallbackModel,
     );
   } catch {
+    signal?.throwIfAborted();
     try {
       return await callOpenAI(
         config.llmFallbackApiKey,
@@ -230,7 +249,128 @@ export const enrichWithLlm = async (
         config.llmFallbackModel,
       );
     } catch {
+      signal?.throwIfAborted();
       return null;
     }
+  }
+};
+
+export const testLlmConnection = async (): Promise<{
+  ok: boolean;
+  provider: "gemini" | "openai";
+  model: string;
+  configured: boolean;
+  responseNames: string[];
+  error?: string;
+}> => {
+  const provider = config.llmProvider;
+  const model = config.llmModel;
+  const key = config.llmApiKey;
+  if (!config.llmEnabled) {
+    return { ok: false, provider, model, configured: false, responseNames: [], error: "LEAD_LLM_ENABLED is false" };
+  }
+  if (!key) {
+    return { ok: false, provider, model, configured: false, responseNames: [], error: "LEAD_LLM_API_KEY is not configured" };
+  }
+  const prompt =
+    'Return JSON exactly: {"names":[{"firstName":"Ada","lastName":"Lovelace","confidence":1,"source":"connection-test"}]}';
+  try {
+    if (provider === "gemini") {
+      const baseUrl =
+        config.llmBaseUrl ||
+        "https://generativelanguage.googleapis.com/v1beta";
+      const response = await fetch(
+        `${baseUrl.replace(/\/$/, "")}/models/${encodeURIComponent(model)}:generateContent`,
+        {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-goog-api-key": key,
+          },
+          body: JSON.stringify({
+            contents: [{ role: "user", parts: [{ text: prompt }] }],
+            generationConfig: {
+              temperature: 0,
+              responseMimeType: "application/json",
+              maxOutputTokens: 128,
+            },
+          }),
+          signal: AbortSignal.timeout(20_000),
+        },
+      );
+      if (!response.ok) {
+        return {
+          ok: false,
+          provider,
+          model,
+          configured: true,
+          responseNames: [],
+          error: `Gemini returned HTTP ${response.status}`,
+        };
+      }
+      const body = await response.json() as {
+        candidates?: Array<{ content?: { parts?: Array<{ text?: string }> } }>;
+      };
+      const content =
+        body.candidates?.[0]?.content?.parts
+          ?.map((part) => part.text || "")
+          .join("") || "";
+      const ok = content.includes("Ada");
+      return {
+        ok,
+        provider,
+        model,
+        configured: true,
+        responseNames: ok ? ["Ada Lovelace"] : [],
+        error: ok ? undefined : "Gemini returned no expected test name",
+      };
+    }
+    const baseUrl = config.llmBaseUrl || "https://api.openai.com/v1";
+    const response = await fetch(`${baseUrl.replace(/\/$/, "")}/chat/completions`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${key}`,
+      },
+      body: JSON.stringify({
+        model,
+        temperature: 0,
+        response_format: { type: "json_object" },
+        messages: [{ role: "system", content: prompt }],
+      }),
+      signal: AbortSignal.timeout(20_000),
+    });
+    if (!response.ok) {
+      return {
+        ok: false,
+        provider,
+        model,
+        configured: true,
+        responseNames: [],
+        error: `OpenAI-compatible provider returned HTTP ${response.status}`,
+      };
+    }
+    const body = await response.json() as {
+      choices?: Array<{ message?: { content?: string } }>;
+    };
+    const content = body.choices?.[0]?.message?.content || "";
+    const ok = content.includes("Ada");
+    return {
+      ok,
+      provider,
+      model,
+      configured: true,
+      responseNames: ok ? ["Ada Lovelace"] : [],
+      error: ok ? undefined : "Provider returned no expected test name",
+    };
+  } catch (error) {
+    return {
+      ok: false,
+      provider,
+      model,
+      configured: true,
+      responseNames: [],
+      error: error instanceof Error ? error.message : "LLM connection test failed",
+    };
   }
 };

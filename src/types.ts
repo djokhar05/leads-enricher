@@ -7,6 +7,23 @@ export type VerificationStatus =
   | "provider_failed"
   | "not_deep_verified";
 
+export interface LeadJobSettings {
+  providerCallLimit: number;
+  batchSize: number;
+  emailColumn?: string;
+  firstNameColumn?: string;
+  lastNameColumn?: string;
+  domainColumn?: string;
+  companyNameColumn?: string;
+  websiteColumn?: string;
+  addressColumn?: string;
+  ownerNameColumn?: string;
+  fullNameColumn?: string;
+  llmEnabled?: boolean;
+  websiteResearchEnabled?: boolean;
+  excludeMissingEmail: boolean;
+}
+
 // Persisted lifecycle state is deliberately local and provider-neutral.
 // It is safe to expose to the admin UI without including lead email addresses.
 export interface LeadJobState {
@@ -20,6 +37,8 @@ export interface LeadJobState {
   processedRows: number;
   providerChecksCount: number;
   billableChecksCount: number;
+  settings?: LeadJobSettings;
+  cacheHitCount?: number;
   retryCount?: number;
   pausedReason?: string;
   pausedAt?: string;
@@ -49,5 +68,6 @@ export interface LeadRow {
   verificationStatus: VerificationStatus | "not_processed";
   verificationReason?: string;
   verificationDomain?: string;
+  verificationFromCache?: boolean;
   provenance: string[];
 }

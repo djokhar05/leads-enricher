@@ -100,6 +100,7 @@ Options:
 --first-name-column <name> First-name column
 --last-name-column <name>  Last-name column
 --domain-column <name>     Company-domain column
+--retain-missing-email     Keep rows without a candidate email
 -h, --help                 Print CLI help
 -v, --version              Print package version
 ```
@@ -127,11 +128,14 @@ The first CSV row supplies column names. A source row receives:
 - A stable `lead_row_id`
 - An existing email or generated candidate patterns
 - Verification status and reason
-- Verification domain
-- Cache indicator
-- Candidate/provenance details
 
 Original source columns are preserved in the output before enrichment columns.
+By default, rows without a candidate email are excluded from the output. The
+admin can turn off this filter when creating a job, API clients can set
+`excludeMissingEmail` to `false`, and CLI users can pass
+`--retain-missing-email`. The input file is unchanged, and job progress counts
+all processed rows. A candidate is not necessarily verified: rows with invalid,
+uncertain, or otherwise unverified candidates are still included.
 
 If an email column exists, the supplied address is authoritative. Otherwise,
 the service currently generates ranked patterns such as:
@@ -207,7 +211,7 @@ Job states:
 | `paused` | Provider/rate-limit pause or operator pause |
 | `completed` | All input rows reached an output state |
 | `failed` | Parser, filesystem, verifier, or service failure |
-| `cancelled` | Operator cancellation at a batch boundary |
+| `cancelled` | Operator cancellation; completed checkpoints are retained |
 
 Supported controls:
 
@@ -217,6 +221,12 @@ Supported controls:
 - Download completed outputs
 - Inspect audit entries
 - Preview/apply retention cleanup
+
+Cancellation interrupts website research and AI requests and asks the verifier
+to stop scheduling further checks. Checks already in progress may finish and
+incur charges; their counts are recorded before cancellation completes.
+Uncheckpointed rows are retried on resume. Both the enrichment service and the
+verifier must run the updated version for cooperative verifier cancellation.
 
 ## Checkpoints and Restart Recovery
 
@@ -234,6 +244,7 @@ Snapshots contain:
 - Processed/total rows
 - Provider and billable call counts
 - Retry count
+- Job mappings, processing settings, and output filter
 - Pause/cancel/error information
 
 At HTTP server startup, durable `queued`, `processing`, and `paused` snapshots
@@ -271,7 +282,8 @@ Malformed CSV behavior depends on parser and column settings:
 - BOM headers are handled
 - Missing/extra column counts are relaxed
 - Missing mapping values produce no candidate
-- Candidate-unavailable rows are marked `not_deep_verified`
+- Candidate-unavailable rows are omitted by default; when retained, they are
+  marked `not_deep_verified`
 - Parsing/filesystem/verifier failures mark the job failed
 - Provider rate limits mark the job paused
 - Cancelled jobs retain already-written rows

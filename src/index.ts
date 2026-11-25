@@ -3,7 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import multer from "multer";
-import { runLeadJob } from "./job";
+import { runLeadJob, type StartLeadJobOptions } from "./job";
 import { ensureDir, loadJobStates, saveJobState } from "./state";
 import type { LeadJobState } from "./types";
 import { config } from "./config";
@@ -12,6 +12,8 @@ import { appendAudit, loadAuditEntries } from "./audit";
 import { diskUsage, memoryUsage } from "./resources";
 import { applyRetention, previewRetention } from "./retention";
 import { getCliVersion, printCliHelp } from "./cli";
+import { detectCsvHeaderMappings } from "./csv";
+import { testLlmConnection } from "./provider-adapters";
 
 // This entry point supports two modes: a local HTTP service or a one-shot CLI job.
 const app = express();
@@ -32,7 +34,17 @@ app.use(requireServiceAuth);
 
 // Track only jobs currently running in this process. Durable job state is read from disk.
 const running = new Map<string, Promise<LeadJobState>>();
-const cancellationRequested = new Set<string>();
+const cancellationControllers = new Map<string, AbortController>();
+
+const startTrackedJob = (options: StartLeadJobOptions): void => {
+  const controller = new AbortController();
+  cancellationControllers.set(options.id, controller);
+  const promise = runLeadJob({ ...options, signal: controller.signal }).finally(() => {
+    running.delete(options.id);
+    cancellationControllers.delete(options.id);
+  });
+  running.set(options.id, promise);
+};
 
 const upload = multer({
   storage: multer.diskStorage({
@@ -133,6 +145,11 @@ app.get("/health", async (_req, res) => {
   });
 });
 
+app.post("/ai/test", async (_req, res) => {
+  const result = await testLlmConnection();
+  res.status(result.ok ? 200 : 503).json(result);
+});
+
 app.get("/jobs", (_req, res) => {
   res.json({ jobs: loadJobStates(stateDir) });
 });
@@ -163,6 +180,12 @@ app.get("/jobs/:jobId/output", (req, res) => {
 });
 
 app.post("/jobs", (req, res) => {
+  console.info("[lead-enrichment] POST /jobs received", {
+    provider: typeof req.body?.provider === "string"
+      ? req.body.provider
+      : "builtin",
+    batchSize: Number(req.body?.batchSize) || config.batchSize,
+  });
   // A new job receives explicit column mappings when the CSV does not contain
   // one of the standard email/name/domain fields.
   const body = req.body as {
@@ -175,9 +198,22 @@ app.post("/jobs", (req, res) => {
     firstNameColumn?: string;
     lastNameColumn?: string;
     domainColumn?: string;
+    companyNameColumn?: string;
+    websiteColumn?: string;
+    addressColumn?: string;
+    ownerNameColumn?: string;
+    fullNameColumn?: string;
     llmEnabled?: boolean;
     websiteResearchEnabled?: boolean;
+    excludeMissingEmail?: boolean;
   };
+  if (
+    body.excludeMissingEmail !== undefined &&
+    typeof body.excludeMissingEmail !== "boolean"
+  ) {
+    res.status(400).json({ error: "excludeMissingEmail must be a boolean" });
+    return;
+  }
   if (!body.inputPath) {
     res.status(400).json({ error: "inputPath is required" });
     return;
@@ -235,6 +271,25 @@ app.post("/jobs", (req, res) => {
     Number.isInteger(body.batchSize) && Number(body.batchSize) > 0
       ? Number(body.batchSize)
       : Number(process.env.LEAD_ENRICHMENT_BATCH_SIZE) || 100;
+  const settings = {
+    providerCallLimit,
+    batchSize,
+    emailColumn: body.emailColumn,
+    firstNameColumn: body.firstNameColumn,
+    lastNameColumn: body.lastNameColumn,
+    domainColumn: body.domainColumn,
+    companyNameColumn: body.companyNameColumn,
+    websiteColumn: body.websiteColumn,
+    addressColumn: body.addressColumn,
+    ownerNameColumn: body.ownerNameColumn,
+    fullNameColumn: body.fullNameColumn,
+    llmEnabled: typeof body.llmEnabled === "boolean" ? body.llmEnabled : config.llmEnabled,
+    websiteResearchEnabled:
+      typeof body.websiteResearchEnabled === "boolean"
+        ? body.websiteResearchEnabled
+        : config.llmWebsiteResearchEnabled,
+    excludeMissingEmail: body.excludeMissingEmail ?? true,
+  };
 
   const initial: LeadJobState = {
     id,
@@ -247,11 +302,18 @@ app.post("/jobs", (req, res) => {
     processedRows: 0,
     providerChecksCount: 0,
     billableChecksCount: 0,
+    settings,
     createdAt: new Date().toISOString(),
     updatedAt: new Date().toISOString(),
   };
   // Save before processing so status and progress survive an API/process restart.
   saveJobState(stateDir, initial);
+  console.info("[lead-enrichment] job queued", {
+    jobId: id,
+    provider,
+    batchSize,
+    excludeMissingEmail: settings.excludeMissingEmail,
+  });
   appendAudit({
     timestamp: new Date().toISOString(),
     hostId: config.hostId,
@@ -262,39 +324,21 @@ app.post("/jobs", (req, res) => {
       provider,
       providerCallLimit,
       batchSize,
+      excludeMissingEmail: settings.excludeMissingEmail,
     },
   });
 
-  const promise = runLeadJob({
+  startTrackedJob({
     id,
     inputPath,
     outputPath,
     stateDir,
     provider,
-    providerCallLimit,
-    batchSize,
+    ...settings,
     verifierBaseUrl,
     verifierAuthToken,
-    emailColumn: body.emailColumn,
-    firstNameColumn: body.firstNameColumn,
-    lastNameColumn: body.lastNameColumn,
-    domainColumn: body.domainColumn,
-    llmEnabled:
-      typeof body.llmEnabled === "boolean"
-        ? body.llmEnabled
-        : config.llmEnabled,
-    websiteResearchEnabled:
-      typeof body.websiteResearchEnabled === "boolean"
-        ? body.websiteResearchEnabled
-        : config.llmWebsiteResearchEnabled,
     initialState: initial,
-    cancelRequested: () => cancellationRequested.has(id),
-  }).finally(() => {
-    running.delete(id);
-    cancellationRequested.delete(id);
   });
-  // Keep in-process status separate from the durable JSON snapshot.
-  running.set(id, promise);
   // Processing continues asynchronously after the job is accepted.
   res.status(202).json(initial);
 });
@@ -421,8 +465,8 @@ app.post("/jobs/:jobId/resume", (req, res) => {
     cancelRequested: false,
     pausedReason: undefined,
     pausedAt: undefined,
+    error: undefined,
   });
-  cancellationRequested.delete(jobId);
   appendAudit({
     timestamp: new Date().toISOString(),
     hostId: config.hostId,
@@ -431,7 +475,7 @@ app.post("/jobs/:jobId/resume", (req, res) => {
     status: "success",
   });
 
-  const promise = runLeadJob({
+  startTrackedJob({
     id: resumed.id,
     inputPath: resumed.inputPath,
     outputPath: resumed.outputPath,
@@ -444,12 +488,7 @@ app.post("/jobs/:jobId/resume", (req, res) => {
     initialState: resumed,
     llmEnabled: config.llmEnabled,
     websiteResearchEnabled: config.llmWebsiteResearchEnabled,
-    cancelRequested: () => cancellationRequested.has(jobId),
-  }).finally(() => {
-    running.delete(jobId);
-    cancellationRequested.delete(jobId);
   });
-  running.set(jobId, promise);
   res.status(202).json(resumed);
 });
 
@@ -464,11 +503,19 @@ app.post("/jobs/:jobId/cancel", (req, res) => {
     res.status(409).json({ error: "Job is already terminal" });
     return;
   }
+  if (existing.cancelRequested && running.has(jobId)) {
+    res.json(existing);
+    return;
+  }
   const cancelled = saveJobState(stateDir, {
     ...existing,
     cancelRequested: true,
+    ...(!running.has(jobId) ? {
+      status: "cancelled" as const,
+      error: "Cancelled by operator",
+    } : {}),
   });
-  cancellationRequested.add(jobId);
+  cancellationControllers.get(jobId)?.abort();
   appendAudit({
     timestamp: new Date().toISOString(),
     hostId: config.hostId,
@@ -499,8 +546,8 @@ app.post("/jobs/:jobId/retry", (req, res) => {
     status: "queued",
     retryCount: (existing.retryCount || 0) + 1,
     cancelRequested: false,
+    error: undefined,
   });
-  cancellationRequested.delete(jobId);
   appendAudit({
     timestamp: new Date().toISOString(),
     hostId: config.hostId,
@@ -508,7 +555,7 @@ app.post("/jobs/:jobId/retry", (req, res) => {
     jobId,
     status: "success",
   });
-  const promise = runLeadJob({
+  startTrackedJob({
     id: retried.id,
     inputPath: retried.inputPath,
     outputPath: retried.outputPath,
@@ -521,19 +568,42 @@ app.post("/jobs/:jobId/retry", (req, res) => {
     initialState: retried,
     llmEnabled: config.llmEnabled,
     websiteResearchEnabled: config.llmWebsiteResearchEnabled,
-    cancelRequested: () => cancellationRequested.has(jobId),
-  }).finally(() => {
-    running.delete(jobId);
-    cancellationRequested.delete(jobId);
   });
-  running.set(jobId, promise);
   res.status(202).json(retried);
 });
 
-app.post("/upload", upload.single("file"), (req, res) => {
+app.post("/upload", upload.single("file"), async (req, res) => {
   if (!req.file) {
     res.status(400).json({ error: "CSV file is required" });
     return;
+  }
+  console.info("[lead-enrichment] POST /upload received", {
+    fileName: req.file.filename,
+    sizeBytes: req.file.size,
+  });
+  let mappings: ReturnType<typeof detectCsvHeaderMappings> | null = null;
+  try {
+    const stream = fs.createReadStream(req.file.path);
+    const { parse } = await import("csv-parse");
+    const parser = stream.pipe(
+      parse({
+        bom: true,
+        columns: false,
+        relax_column_count: true,
+        skip_empty_lines: true,
+        to_line: 1,
+      }),
+    );
+    for await (const record of parser as AsyncIterable<unknown>) {
+      if (Array.isArray(record)) {
+        mappings = detectCsvHeaderMappings(
+          record.map((value) => String(value || "")),
+        );
+      }
+      break;
+    }
+  } catch {
+    mappings = null;
   }
   appendAudit({
     timestamp: new Date().toISOString(),
@@ -548,6 +618,7 @@ app.post("/upload", upload.single("file"), (req, res) => {
   res.status(201).json({
     fileName: req.file.filename,
     inputPath: req.file.path,
+    mappings,
   });
 });
 
@@ -611,6 +682,17 @@ if (
 } else if (isCli && process.argv.includes("--serve")) {
   for (const state of loadJobStates(stateDir)) {
     if (
+      state.cancelRequested &&
+      ["queued", "processing", "paused"].includes(state.status)
+    ) {
+      saveJobState(stateDir, {
+        ...state,
+        status: "cancelled",
+        error: "Cancelled by operator",
+      });
+      continue;
+    }
+    if (
       ["queued", "processing", "paused"].includes(state.status) &&
       !state.cancelRequested
     ) {
@@ -628,7 +710,7 @@ if (
         jobId: resumed.id,
         status: "success",
       });
-      const promise = runLeadJob({
+      startTrackedJob({
         id: resumed.id,
         inputPath: resumed.inputPath,
         outputPath: resumed.outputPath,
@@ -641,16 +723,50 @@ if (
         initialState: resumed,
         llmEnabled: config.llmEnabled,
         websiteResearchEnabled: config.llmWebsiteResearchEnabled,
-        cancelRequested: () => cancellationRequested.has(resumed.id),
-      }).finally(() => {
-        running.delete(resumed.id);
-        cancellationRequested.delete(resumed.id);
       });
-      running.set(resumed.id, promise);
     }
   }
-  app.listen(port, () => {
+  const server = app.listen(port, () => {
     console.log(`Lead enrichment service listening on port ${port}`);
+  });
+  server.on("error", (error) => {
+    if (
+      error &&
+      "code" in error &&
+      error.code === "EADDRINUSE"
+    ) {
+      void fetch(`http://127.0.0.1:${port}/health`, {
+        headers: config.authToken
+          ? { Authorization: `Bearer ${config.authToken}` }
+          : {},
+        signal: AbortSignal.timeout(3_000),
+      }).then((response) => {
+        if (response.ok) {
+          console.info(
+            `[lead-enrichment] port ${port} already has a healthy enrichment service; reusing existing process`,
+          );
+          process.exitCode = 0;
+          return;
+        }
+        console.error("[lead-enrichment] HTTP server failed to start", {
+          port,
+          error: "address already in use",
+        });
+        process.exitCode = 1;
+      }).catch(() => {
+        console.error("[lead-enrichment] HTTP server failed to start", {
+          port,
+          error: "address already in use",
+        });
+        process.exitCode = 1;
+      });
+      return;
+    }
+    console.error("[lead-enrichment] HTTP server failed to start", {
+      port,
+      error: error instanceof Error ? error.message : String(error),
+    });
+    process.exitCode = 1;
   });
 } else if (isCli) {
   // Minimal argument parser for one-shot local CSV processing.
@@ -699,8 +815,10 @@ if (
       firstNameColumn: argument("--first-name-column"),
       lastNameColumn: argument("--last-name-column"),
       domainColumn: argument("--domain-column"),
+      fullNameColumn: argument("--full-name-column"),
       llmEnabled: config.llmEnabled,
       websiteResearchEnabled: config.llmWebsiteResearchEnabled,
+      excludeMissingEmail: !process.argv.includes("--retain-missing-email"),
     }).then((state) => {
       console.log(JSON.stringify(state));
     });
