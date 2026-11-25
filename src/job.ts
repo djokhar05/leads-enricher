@@ -5,7 +5,9 @@ import {
   csvEscape,
   normalizeDomain,
   rankedCandidateEmails,
+  splitFullName,
   stableRowId,
+  valueFromRow,
 } from "./csv";
 import { ensureDir, saveJobState } from "./state";
 import { verifyBatch } from "./verifier-client";
@@ -66,6 +68,13 @@ const legacyOutputColumns = [
   "verification_from_cache",
   "verification_provenance",
 ];
+
+const matchesCompanyName = (name: string, company: string): boolean => {
+  const normalize = (value: string): string =>
+    value.normalize("NFKC").toLowerCase().replace(/[^\p{L}\p{N}]/gu, "");
+  const normalizedName = normalize(name.replace(/\s*\(Owner\)$/i, ""));
+  return Boolean(normalizedName && normalizedName === normalize(company));
+};
 
 // Runs one CSV job end to end. Processing is checkpointed after bounded batches
 // so provider counts, progress, and already-written output survive interruptions.
@@ -194,12 +203,12 @@ export const runLeadJob = async (
             ? await researchCompanyDomain(domain, options.signal)
             : null;
         throwIfCancelled();
+        const companyName = options.companyNameColumn
+          ? valueFromRow(lead.source, options.companyNameColumn)
+          : "";
         const discovered = await enrichWithLlm({
           domain,
-          companyName:
-            (options.companyNameColumn
-              ? String(lead.source[options.companyNameColumn] || "").trim()
-              : "") || research?.title,
+          companyName: companyName || research?.title,
           sourceUrl: research?.url,
           sourceText: research?.text,
         }, options.signal);
@@ -237,7 +246,7 @@ export const runLeadJob = async (
           ...new Set([
             ...effectiveDiscovery.names,
             fallbackOwnerName,
-          ].filter(Boolean)),
+          ].filter((name) => name && !matchesCompanyName(name, companyName))),
         ];
         for (const fullName of discoverableNames) {
           const parts = fullName
@@ -435,7 +444,7 @@ export const runLeadJob = async (
       // Candidate discovery stays separate from verification. Only one pattern
       // candidate is selected per row in this first implementation.
       // A supplied email wins; otherwise name/domain patterns are generated.
-      const rankedCandidates = rankedCandidateEmails(
+      let rankedCandidates = rankedCandidateEmails(
         record,
         options.emailColumn,
         options.firstNameColumn,
@@ -443,6 +452,23 @@ export const runLeadJob = async (
         options.domainColumn,
         options.fullNameColumn,
       );
+      if (rankedCandidates[0]?.provenance !== "source-email") {
+        const sourceFirstName = valueFromRow(record, options.firstNameColumn);
+        const sourceLastName = valueFromRow(record, options.lastNameColumn);
+        const sourceFullName = valueFromRow(record, options.fullNameColumn);
+        const fullName = options.fullNameColumn
+          ? splitFullName(sourceFullName)
+          : { firstName: "", lastName: "" };
+        const firstName = sourceFirstName || fullName.firstName;
+        const lastName = sourceLastName || fullName.lastName;
+        const companyName = valueFromRow(record, options.companyNameColumn);
+        if (
+          matchesCompanyName(`${firstName} ${lastName}`, companyName) ||
+          (!sourceFirstName && !sourceLastName && matchesCompanyName(sourceFullName, companyName))
+        ) {
+          rankedCandidates = [];
+        }
+      }
       const suppressed = rankedCandidates.some((candidate) =>
         isSuppressed(candidate.email),
       );

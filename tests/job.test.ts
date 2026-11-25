@@ -63,6 +63,108 @@ test("new output omits verification metadata while preserving source values", as
   assert.match(rows[1][5], /^accepted/);
 });
 
+test("company names are not used as person names for candidate generation", async (t) => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "lead-job-test-"));
+  const previous = {
+    auditDir: config.auditDir,
+    enabled: config.llmEnabled,
+    provider: config.llmProvider,
+    key: config.llmApiKey,
+    baseUrl: config.llmBaseUrl,
+  };
+  config.auditDir = path.join(directory, "audit");
+  config.llmEnabled = true;
+  config.llmProvider = "gemini";
+  config.llmApiKey = "test-key";
+  config.llmBaseUrl = "http://ai.test";
+  t.after(() => {
+    config.auditDir = previous.auditDir;
+    config.llmEnabled = previous.enabled;
+    config.llmProvider = previous.provider;
+    config.llmApiKey = previous.key;
+    config.llmBaseUrl = previous.baseUrl;
+    fs.rmSync(directory, { recursive: true, force: true });
+  });
+  const inputPath = path.join(directory, "input.csv");
+  const outputPath = path.join(directory, "output.csv");
+  fs.writeFileSync(inputPath,
+    'company,website,owner,person,email\n' +
+    '"Lassonde Studios",owner.test,"Lassonde Studios (Owner)",,\n' +
+    '"Acme Studio",ai.test,,,\n' +
+    '"River Works",person.test,"Jane Smith (Owner)",,\n' +
+    '"North Works",other.test,,,\n' +
+    '"West Works",mapped.test,,"WEST, Works (Owner)",\n' +
+    '"East Works",existing.test,,"East Works",contact@existing.test\n',
+  );
+  const verifiedEmails: string[] = [];
+  t.mock.method(globalThis, "fetch", async (...[input, init]: Parameters<typeof fetch>) => {
+    if (String(input).startsWith("http://ai.test")) {
+      const request = JSON.parse(String(init?.body)) as {
+        contents: Array<{ parts: Array<{ text: string }> }>;
+      };
+      const research = JSON.parse(request.contents[0].parts[0].text) as { domain: string };
+      const names = research.domain === "ai.test"
+        ? [{ firstName: "ACME", lastName: "Studio" }]
+        : research.domain === "other.test"
+          ? [{ firstName: "North", lastName: "Works" }, { firstName: "Alex", lastName: "Jones" }]
+          : [];
+      return new Response(JSON.stringify({
+        candidates: [{ content: { parts: [{ text: JSON.stringify({ names }) }] } }],
+      }));
+    }
+    const request = JSON.parse(String(init?.body)) as { emails: string[] };
+    verifiedEmails.push(...request.emails);
+    return new Response(JSON.stringify({
+      requestId: "test",
+      provider: "builtin",
+      results: request.emails.map((email) => ({
+        email, status: "uncertain", reason: "unconfirmed", fromCache: false, billable: true,
+      })),
+      providerChecksCount: request.emails.length,
+      billableChecksCount: request.emails.length,
+      cacheHitCount: 0,
+    }));
+  });
+  const state = await runLeadJob({
+    id: "company-name",
+    inputPath,
+    outputPath,
+    stateDir: path.join(directory, "jobs"),
+    provider: "builtin",
+    providerCallLimit: 100,
+    batchSize: 10,
+    verifierBaseUrl: "http://verifier.test",
+    verifierAuthToken: "",
+    companyNameColumn: "company",
+    websiteColumn: "website",
+    domainColumn: "website",
+    ownerNameColumn: "owner",
+    fullNameColumn: "person",
+    emailColumn: "email",
+    llmEnabled: true,
+    websiteResearchEnabled: false,
+    excludeMissingEmail: false,
+  });
+  assert.equal(state.status, "completed");
+  const rows: Array<Record<string, string>> = parse(fs.readFileSync(outputPath), { columns: true });
+  for (const index of [0, 1, 4]) {
+    assert.equal(rows[index].candidate_email, "");
+    assert.equal(rows[index].verification_status, "not_deep_verified");
+  }
+  assert.equal(rows[2].candidate_email, "jane.smith@person.test");
+  assert.equal(rows[3].candidate_email, "alex.jones@other.test");
+  assert.equal(rows[5].candidate_email, "contact@existing.test");
+  assert.ok(verifiedEmails.includes("contact@existing.test"));
+  assert.ok(verifiedEmails.includes("jane.smith@person.test"));
+  assert.ok(verifiedEmails.includes("alex.jones@other.test"));
+  assert.ok(verifiedEmails.every((email) =>
+    !email.endsWith("@owner.test") &&
+    !email.endsWith("@ai.test") &&
+    !email.endsWith("@mapped.test") &&
+    !email.startsWith("north.works@"),
+  ));
+});
+
 test("resuming a legacy output keeps its existing columns aligned", async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "lead-job-test-"));
   const previousAuditDir = config.auditDir;

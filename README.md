@@ -154,6 +154,20 @@ initiallast@domain
 ```
 
 These are candidates, not confirmed mailbox addresses.
+Names that match the mapped company name are not used to generate candidates.
+This only catches matching names; it does not confirm that other names belong
+to the company or that a verified address belongs to the intended person.
+
+To copy the header and a chosen number of data rows into a new CSV without
+splitting multiline fields, run:
+
+```bash
+python3 scripts/first-rows.py 1000 input.csv first-1000.csv
+```
+
+The output file must not already exist. Use a complete source CSV; malformed
+records encountered within the selected rows are reported as errors. If fewer
+rows are available, all available rows are copied.
 
 ## Processing Concurrency
 
