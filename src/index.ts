@@ -661,9 +661,8 @@ app.post("/retention/apply", (_req, res) => {
   res.json(preview);
 });
 
-// Determine which mode this process should run by inspecting the executable arguments.
-const isCli = process.argv[1]?.endsWith("/lead-enrichment/dist/index.js") ||
-  process.argv[1]?.endsWith("/lead-enrichment/src/index.ts");
+// Only start a server or CLI job when this module is the entry point.
+const isCli = require.main === module;
 
 // CLI information flags take precedence over server and job modes.
 if (
