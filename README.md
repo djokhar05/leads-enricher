@@ -73,13 +73,19 @@ client-side configuration.
 ## Run the HTTP Service
 
 ```bash
-npm start -- --serve
+npm start
 ```
 
 The service listens on `PORT`, defaulting to `3002`.
 
 Bind it only to localhost or a private network for normal deployment. The
 platform backend is the intended public proxy.
+
+For a persistent PM2 process, run `npm run start:pm2` from the service
+directory. This builds the service, starts it, and saves the PM2 process list.
+To restore it after a server reboot, configure `pm2 startup` once and follow
+the command it prints. For subsequent deployments, rebuild and run
+`pm2 restart lead-enrichment` rather than starting a duplicate process.
 
 ## Run the CLI
 
