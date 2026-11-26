@@ -3,8 +3,9 @@ import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import multer from "multer";
-import { runLeadJob, type StartLeadJobOptions } from "./job";
+import { runLeadJob, VERIFIER_REVIEW_REQUIRED, type StartLeadJobOptions } from "./job";
 import { ensureDir, loadJobStates, saveJobState } from "./state";
+import { loadPendingBatch, reconcileBatchAcknowledgements } from "./pending-batch";
 import type { LeadJobState } from "./types";
 import { config } from "./config";
 import { requireServiceAuth, resolveAllowedInputPath, resolveAllowedOutputPath } from "./security";
@@ -16,7 +17,7 @@ import { detectCsvHeaderMappings } from "./csv";
 import { testLlmConnection } from "./provider-adapters";
 
 // This entry point supports two modes: a local HTTP service or a one-shot CLI job.
-const app = express();
+export const app = express();
 app.use(express.json({ limit: "2mb" }));
 
 // All files and durable state stay on the enrichment host; nothing is uploaded to S3.
@@ -444,7 +445,124 @@ app.delete("/files", (req, res) => {
   res.json({ deleted: true, path: resolvedPath });
 });
 
-app.post("/jobs/:jobId/resume", (req, res) => {
+app.get("/jobs/:jobId/review", async (req, res) => {
+  const jobId = String(req.params.jobId);
+  const job = loadJobStates(stateDir).find((state) => state.id === jobId);
+  if (!job) {
+    res.status(404).json({ error: "Job not found" });
+    return;
+  }
+  const pending = loadPendingBatch(stateDir, jobId);
+  if (job.pausedReason !== VERIFIER_REVIEW_REQUIRED || !pending) {
+    res.status(409).json({ error: "This job has no recoverable batch awaiting review" });
+    return;
+  }
+  try {
+    const response = await fetch(
+      `${verifierBaseUrl.replace(/\/$/, "")}/api/batches/${encodeURIComponent(pending.requestId)}/review`,
+      {
+        headers: verifierAuthToken ? { Authorization: `Bearer ${verifierAuthToken}` } : {},
+        signal: AbortSignal.timeout(10_000),
+      },
+    );
+    if (response.status === 409) {
+      const statusResponse = await fetch(
+        `${verifierBaseUrl.replace(/\/$/, "")}/api/batches/${encodeURIComponent(pending.requestId)}`,
+        {
+          headers: verifierAuthToken ? { Authorization: `Bearer ${verifierAuthToken}` } : {},
+          signal: AbortSignal.timeout(10_000),
+        },
+      );
+      if (statusResponse.ok) {
+        const status: unknown = await statusResponse.json();
+        if (typeof status === "object" && status !== null &&
+            "requestId" in status && status.requestId === pending.requestId &&
+            "status" in status && typeof status.status === "string" &&
+            ["queued", "processing", "completed", "cancelled"].includes(status.status)) {
+          res.json({ status: "reconnect" });
+          return;
+        }
+      }
+    }
+    res.status(response.status).json(await response.json());
+  } catch (error) {
+    console.error("[lead-enrichment] unable to load batch review", {
+      jobId, error: error instanceof Error ? error.message : String(error),
+    });
+    res.status(502).json({ error: "Unable to load verifier batch review" });
+  }
+});
+
+app.post("/jobs/:jobId/review", async (req, res) => {
+  const jobId = String(req.params.jobId);
+  const job = loadJobStates(stateDir).find((state) => state.id === jobId);
+  if (!job) {
+    res.status(404).json({ error: "Job not found" });
+    return;
+  }
+  if (running.has(jobId) || job.pausedReason !== VERIFIER_REVIEW_REQUIRED) {
+    res.status(409).json({ error: "Job is not waiting for a verifier review" });
+    return;
+  }
+  const pending = loadPendingBatch(stateDir, jobId);
+  const token: unknown = req.body?.token;
+  const action: unknown = req.body?.action;
+  if (!pending || typeof token !== "string" || !token || !["skip", "retry"].includes(String(action)) ||
+      (action === "retry" && req.body?.confirmDuplicateCharge !== true)) {
+    res.status(400).json({ error: "A pending batch, review token and action are required; retry also requires duplicate-charge confirmation" });
+    return;
+  }
+  try {
+    const response = await fetch(
+      `${verifierBaseUrl.replace(/\/$/, "")}/api/batches/${encodeURIComponent(pending.requestId)}/review`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(verifierAuthToken ? { Authorization: `Bearer ${verifierAuthToken}` } : {}),
+        },
+        body: JSON.stringify({ token, action, confirmDuplicateCharge: req.body?.confirmDuplicateCharge }),
+        signal: AbortSignal.timeout(10_000),
+      },
+    );
+    const payload: unknown = await response.json();
+    if (!response.ok) {
+      console.warn("[lead-enrichment] verifier rejected batch review", {
+        jobId, requestId: pending.requestId, httpStatus: response.status,
+      });
+      res.status(response.status).json(payload);
+      return;
+    }
+    if (typeof payload !== "object" || payload === null || !("status" in payload) ||
+        typeof payload.status !== "string") {
+      res.status(502).json({ error: "Verifier returned an invalid review response" });
+      return;
+    }
+    if (["queued", "processing", "completed", "cancelled"].includes(payload.status)) {
+      saveJobState(stateDir, {
+        ...job,
+        pausedReason: "Verifier batch reviewed; ready to resume",
+        error: undefined,
+      });
+    }
+    appendAudit({
+      timestamp: new Date().toISOString(),
+      hostId: config.hostId,
+      action: "lead_enrichment.batch.reviewed",
+      jobId,
+      status: "success",
+      metadata: { decision: action },
+    });
+    res.json(payload);
+  } catch (error) {
+    console.error("[lead-enrichment] unable to submit batch review", {
+      jobId, error: error instanceof Error ? error.message : String(error),
+    });
+    res.status(502).json({ error: "Unable to submit verifier batch review; retry the same decision" });
+  }
+});
+
+app.post("/jobs/:jobId/resume", async (req, res) => {
   const jobId = String(req.params.jobId);
   const existing = loadJobStates(stateDir).find((job) => job.id === jobId);
   if (!existing) {
@@ -457,6 +575,45 @@ app.post("/jobs/:jobId/resume", (req, res) => {
   }
   if (!["paused", "failed", "cancelled"].includes(existing.status)) {
     res.status(409).json({ error: "Only paused, failed, or cancelled jobs can resume" });
+    return;
+  }
+  if (existing.pausedReason === VERIFIER_REVIEW_REQUIRED) {
+    const pending = loadPendingBatch(stateDir, jobId);
+    if (!pending) {
+      res.status(409).json({ error: "The pending verifier batch is missing; operator review is required" });
+      return;
+    }
+    try {
+      const response = await fetch(
+        `${verifierBaseUrl.replace(/\/$/, "")}/api/batches/${encodeURIComponent(pending.requestId)}`,
+        {
+          headers: verifierAuthToken ? { Authorization: `Bearer ${verifierAuthToken}` } : {},
+          signal: AbortSignal.timeout(10_000),
+        },
+      );
+      const batch: unknown = await response.json();
+      if (!response.ok || typeof batch !== "object" || batch === null ||
+          !("requestId" in batch) || batch.requestId !== pending.requestId ||
+          !("status" in batch) || typeof batch.status !== "string" ||
+          !["queued", "processing", "completed", "cancelled"].includes(batch.status)) {
+        console.warn("[lead-enrichment] verifier batch cannot be reconnected", {
+          jobId, requestId: pending.requestId, httpStatus: response.status,
+        });
+        res.status(409).json({ error: "Verifier outcome requires operator review; resume could duplicate paid checks" });
+        return;
+      }
+    } catch (error) {
+      console.error("[lead-enrichment] unable to reconnect verifier batch", {
+        jobId, requestId: pending.requestId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      res.status(502).json({ error: "Unable to reconnect to the verifier batch" });
+      return;
+    }
+  }
+  const latest = loadJobStates(stateDir).find((job) => job.id === jobId);
+  if (running.has(jobId) || !latest || latest.updatedAt !== existing.updatedAt) {
+    res.status(409).json({ error: "Job changed while the verifier was being checked; refresh and try again" });
     return;
   }
   const resumed = saveJobState(stateDir, {
@@ -535,6 +692,10 @@ app.post("/jobs/:jobId/retry", (req, res) => {
   }
   if (!["failed", "paused"].includes(existing.status)) {
     res.status(409).json({ error: "Only failed or paused jobs can retry" });
+    return;
+  }
+  if (existing.pausedReason === VERIFIER_REVIEW_REQUIRED) {
+    res.status(409).json({ error: "Verifier outcome requires operator review; automatic retry could duplicate paid checks" });
     return;
   }
   if ((existing.retryCount || 0) >= config.maxRetryAttempts) {
@@ -679,11 +840,34 @@ if (
   process.exitCode = 0;
 // API server mode is explicitly selected to avoid starting a port for every CLI invocation.
 } else if (isCli && process.argv.includes("--serve")) {
+  let acknowledging = false;
+  const acknowledgeBatches = (): void => {
+    if (acknowledging) return;
+    acknowledging = true;
+    void reconcileBatchAcknowledgements(stateDir, verifierBaseUrl, verifierAuthToken)
+      .catch((error: unknown) => console.error("[lead-enrichment] batch acknowledgement recovery failed", {
+        error: error instanceof Error ? error.message : String(error),
+      }))
+      .finally(() => { acknowledging = false; });
+  };
+  acknowledgeBatches();
+  const acknowledgementTimer = setInterval(acknowledgeBatches, 60_000);
+  acknowledgementTimer.unref();
   for (const state of loadJobStates(stateDir)) {
     if (
       state.cancelRequested &&
       ["queued", "processing", "paused"].includes(state.status)
     ) {
+      if (loadPendingBatch(stateDir, state.id)) {
+        saveJobState(stateDir, {
+          ...state,
+          status: "paused",
+          pausedReason: VERIFIER_REVIEW_REQUIRED,
+          pausedAt: new Date().toISOString(),
+          error: "Cancellation was interrupted; the verifier batch and its billing require operator review",
+        });
+        continue;
+      }
       saveJobState(stateDir, {
         ...state,
         status: "cancelled",
@@ -693,7 +877,8 @@ if (
     }
     if (
       ["queued", "processing", "paused"].includes(state.status) &&
-      !state.cancelRequested
+      !state.cancelRequested &&
+      state.pausedReason !== VERIFIER_REVIEW_REQUIRED
     ) {
       if (running.size >= config.maxConcurrentJobs) break;
       const resumed = saveJobState(stateDir, {

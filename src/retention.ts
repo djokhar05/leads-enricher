@@ -2,6 +2,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { config } from "./config";
 import { loadJobStates } from "./state";
+import { loadPendingBatch } from "./pending-batch";
 
 export interface RetentionPreview {
   cutoff: string;
@@ -21,7 +22,8 @@ export const previewRetention = (): RetentionPreview => {
   const jobs = loadJobStates(config.stateDir)
     .filter((job) =>
       ["completed", "failed"].includes(job.status) &&
-      new Date(job.updatedAt).getTime() < cutoffMs
+      new Date(job.updatedAt).getTime() < cutoffMs &&
+      !loadPendingBatch(config.stateDir, job.id)
     )
     .map((job) => ({
       id: job.id,

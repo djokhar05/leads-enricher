@@ -8,12 +8,14 @@ const node_fs_1 = __importDefault(require("node:fs"));
 const node_path_1 = __importDefault(require("node:path"));
 const config_1 = require("./config");
 const state_1 = require("./state");
+const pending_batch_1 = require("./pending-batch");
 const previewRetention = () => {
     const cutoffMs = Date.now() - config_1.config.retentionDays * 24 * 60 * 60 * 1000;
     const cutoff = new Date(cutoffMs).toISOString();
     const jobs = (0, state_1.loadJobStates)(config_1.config.stateDir)
         .filter((job) => ["completed", "failed"].includes(job.status) &&
-        new Date(job.updatedAt).getTime() < cutoffMs)
+        new Date(job.updatedAt).getTime() < cutoffMs &&
+        !(0, pending_batch_1.loadPendingBatch)(config_1.config.stateDir, job.id))
         .map((job) => ({
         id: job.id,
         status: job.status,

@@ -24,6 +24,36 @@ Recommended initial host:
 
 A 4-core/16 GB host is safer for concurrent jobs or large verification batches.
 
+## Verifier batch recovery
+
+Enrichment submits durable verifier batches and polls for results without a
+30-second overall batch deadline. Candidate rows and output offsets are stored
+in a private `pending-batches` directory under the job state directory so an
+interrupted batch can reuse the same request ID and truncate uncommitted output.
+
+An ambiguous provider check pauses for operator review. The admin can skip it
+or explicitly retry with a duplicate-charge warning; skipping does not establish
+whether the original check was billed. If the batch becomes reachable without
+requiring a decision, the admin can reconnect to it.
+
+User-upload jobs also pause when billing is uncertain. New paid upload jobs
+journal completed rows. An admin can resolve confirmed billing, skip the unknown
+check, or explicitly retry it with duplicate-charge confirmation and an additional
+reservation. The original hold remains visible independently of continuation.
+Completed verifier batches are acknowledged only after the output checkpoint is
+durable; a persistent acknowledgement outbox retries delivery after failures
+and restarts. The verifier retains permanent request-ID tombstones and keeps
+unacknowledged or non-completed batches. Matching completed upload journals are
+removed after backend settlement; unresolved or unmatched journals remain.
+The asynchronous timeout/concurrency core is implemented and covered by local
+and cross-service restart tests. Real paid-provider traffic, S3, and
+1-million-row-plus production benchmarks remain required before production rollout.
+
+For batch review and reconnect failures, use the enrichment job ID and verifier
+request ID to correlate service logs. These new events do not include review
+tokens or checked addresses, but existing logs may contain sensitive data;
+redact addresses and credentials before sharing them.
+
 ## Install
 
 ```bash
@@ -267,8 +297,8 @@ Snapshots contain:
 - Job mappings, processing settings, and output filter
 - Pause/cancel/error information
 
-At HTTP server startup, durable `queued`, `processing`, and `paused` snapshots
-are requeued up to the configured concurrency limit.
+At HTTP server startup, recoverable snapshots are requeued up to the configured
+concurrency limit; jobs requiring verifier review remain paused.
 
 Already-written output is retained. Restart behavior should be tested against
 the actual input/output size before production use.

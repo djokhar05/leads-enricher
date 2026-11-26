@@ -12,8 +12,20 @@ export const ensureDir = (directory: string): void => {
 export const atomicWriteJson = (filePath: string, value: unknown): void => {
   ensureDir(path.dirname(filePath));
   const temporary = `${filePath}.tmp`;
-  fs.writeFileSync(temporary, JSON.stringify(value, null, 2), "utf8");
+  const fd = fs.openSync(temporary, "w", 0o600);
+  try {
+    fs.writeFileSync(fd, JSON.stringify(value, null, 2), "utf8");
+    fs.fsyncSync(fd);
+  } finally {
+    fs.closeSync(fd);
+  }
   fs.renameSync(temporary, filePath);
+  const parent = fs.openSync(path.dirname(filePath), "r");
+  try {
+    fs.fsyncSync(parent);
+  } finally {
+    fs.closeSync(parent);
+  }
 };
 
 // Updates the timestamp and atomically replaces one job snapshot.

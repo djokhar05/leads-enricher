@@ -3,9 +3,10 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.runLeadJob = void 0;
+exports.runLeadJob = exports.VERIFIER_REVIEW_REQUIRED = void 0;
 const node_fs_1 = __importDefault(require("node:fs"));
 const node_path_1 = __importDefault(require("node:path"));
+const node_crypto_1 = require("node:crypto");
 const csv_parse_1 = require("csv-parse");
 const csv_1 = require("./csv");
 const state_1 = require("./state");
@@ -14,6 +15,7 @@ const suppressions_1 = require("./suppressions");
 const domain_cache_1 = require("./domain-cache");
 const audit_1 = require("./audit");
 const config_1 = require("./config");
+const pending_batch_1 = require("./pending-batch");
 const provider_adapters_1 = require("./provider-adapters");
 const website_research_1 = require("./website-research");
 class JobCancelledError extends Error {
@@ -21,6 +23,7 @@ class JobCancelledError extends Error {
         super("Cancelled by operator");
     }
 }
+exports.VERIFIER_REVIEW_REQUIRED = "Verifier outcome requires operator review";
 const outputColumns = [
     "lead_row_id",
     "candidate_email",
@@ -95,7 +98,31 @@ const runLeadJob = async (options) => {
             excludeMissingEmail,
         },
     });
-    if (state.checkpointRow === 0) {
+    let pending = (0, pending_batch_1.loadPendingBatch)(options.stateDir, options.id);
+    let pendingBatchProcessed = false;
+    if (pending && state.checkpointRow >= pending.endRow) {
+        (0, pending_batch_1.completePendingBatch)(options.stateDir, pending);
+        pending = undefined;
+    }
+    if (pending) {
+        if (pending.startRow !== state.checkpointRow + 1 ||
+            !node_fs_1.default.existsSync(options.outputPath) ||
+            node_fs_1.default.statSync(options.outputPath).size < pending.outputOffset) {
+            throw new Error("Saved enrichment batch and output checkpoint do not match");
+        }
+        node_fs_1.default.truncateSync(options.outputPath, pending.outputOffset);
+        state.tokenCount = pending.tokenCount;
+        state.costEstimateUsd = pending.costEstimateUsd;
+        if (pending.providerChecksCount !== undefined)
+            state.providerChecksCount = pending.providerChecksCount;
+        if (pending.billableChecksCount !== undefined)
+            state.billableChecksCount = pending.billableChecksCount;
+        if (pending.billingUnknownCount !== undefined)
+            state.billingUnknownCount = pending.billingUnknownCount;
+        if (pending.cacheHitCount !== undefined)
+            state.cacheHitCount = pending.cacheHitCount;
+    }
+    else if (state.checkpointRow === 0) {
         // Start with an empty destination for a new job; resume mode appends later.
         node_fs_1.default.writeFileSync(options.outputPath, "", "utf8");
     }
@@ -118,6 +145,18 @@ const runLeadJob = async (options) => {
             output.once("error", reject);
         });
     };
+    const flushOutput = async () => {
+        await new Promise((resolve, reject) => {
+            output.write("", (error) => error ? reject(error) : resolve());
+        });
+        const fd = node_fs_1.default.openSync(options.outputPath, "r");
+        try {
+            node_fs_1.default.fsyncSync(fd);
+        }
+        finally {
+            node_fs_1.default.closeSync(fd);
+        }
+    };
     // This parser streams records from disk instead of loading the complete CSV.
     const input = node_fs_1.default.createReadStream(options.inputPath);
     const parser = input.pipe((0, csv_parse_1.parse)({
@@ -132,7 +171,14 @@ const runLeadJob = async (options) => {
         }
     };
     const emitBatch = async (batch) => {
-        if (options.llmEnabled) {
+        if (pending) {
+            if (pending.endRow !== rowNumber || pending.rows.length !== batch.length ||
+                pending.rows.some((row, index) => row.rowId !== batch[index].rowId)) {
+                throw new Error("Input rows do not match the saved enrichment batch");
+            }
+            batch.splice(0, batch.length, ...pending.rows);
+        }
+        else if (options.llmEnabled) {
             for (const lead of batch) {
                 throwIfCancelled();
                 if ((lead.rankedCandidates || []).length > 0)
@@ -238,6 +284,25 @@ const runLeadJob = async (options) => {
             }
         }
         throwIfCancelled();
+        if (!pending) {
+            await flushOutput();
+            pending = {
+                version: 1,
+                jobId: options.id,
+                requestId: `${options.id}-${(0, node_crypto_1.randomUUID)()}`,
+                startRow: rowNumber - batch.length + 1,
+                endRow: rowNumber,
+                outputOffset: node_fs_1.default.statSync(options.outputPath).size,
+                rows: batch,
+                tokenCount: state.tokenCount,
+                costEstimateUsd: state.costEstimateUsd,
+                providerChecksCount: state.providerChecksCount,
+                billableChecksCount: state.billableChecksCount,
+                billingUnknownCount: state.billingUnknownCount || 0,
+                cacheHitCount: state.cacheHitCount || 0,
+            };
+            (0, pending_batch_1.savePendingBatch)(options.stateDir, pending);
+        }
         // A row with no candidate is retained but explicitly marked not verified.
         // The addresses below, rather than the source rows, determine provider calls.
         // Only candidate addresses consume the verifier/provider budget.
@@ -257,9 +322,15 @@ const runLeadJob = async (options) => {
             // Remaining job budget is calculated here so each batch cannot overspend
             // the operator's configured enrichment provider-call limit.
             // The batch response is authoritative for both provider counts and outcomes.
-            const response = await (0, verifier_client_1.verifyBatch)(options.verifierBaseUrl, options.verifierAuthToken, options.id, options.provider, candidates, Math.max(options.providerCallLimit - state.providerChecksCount, 0), options.signal);
+            const response = await (0, verifier_client_1.verifyBatch)(options.verifierBaseUrl, options.verifierAuthToken, pending.requestId, options.provider, candidates, Math.max(options.providerCallLimit - state.providerChecksCount, 0), options.signal);
+            if (response.status === "completed") {
+                pending.verifierCompleted = true;
+                (0, pending_batch_1.savePendingBatch)(options.stateDir, pending);
+            }
             state.providerChecksCount += response.providerChecksCount;
             state.billableChecksCount += response.billableChecksCount;
+            state.billingUnknownCount =
+                (state.billingUnknownCount || 0) + (response.billingUnknownCount || 0);
             state.cacheHitCount =
                 (state.cacheHitCount || 0) + response.cacheHitCount;
             throwIfCancelled();
@@ -324,6 +395,7 @@ const runLeadJob = async (options) => {
             ];
             await writeOutput(`${line.map(csv_1.csvEscape).join(",")}\n`);
         }
+        pendingBatchProcessed = true;
     };
     try {
         if (headerWritten && state.checkpointRow > 0) {
@@ -397,6 +469,7 @@ const runLeadJob = async (options) => {
             if (batch.length >= options.batchSize) {
                 throwIfCancelled();
                 await emitBatch(batch);
+                await flushOutput();
                 // Checkpoint only after this batch was sent to the verifier and written
                 // locally, avoiding duplicate output on restart.
                 state.processedRows = rowNumber;
@@ -413,6 +486,10 @@ const runLeadJob = async (options) => {
                         batch.filter((lead) => lead.rankedCandidates?.some((candidate) => (0, suppressions_1.isSuppressed)(candidate.email))).length;
                 batch = [];
                 state = (0, state_1.saveJobState)(options.stateDir, state);
+                if (pending)
+                    (0, pending_batch_1.completePendingBatch)(options.stateDir, pending);
+                pending = undefined;
+                pendingBatchProcessed = false;
                 console.info("[lead-enrichment] checkpoint", {
                     jobId: options.id,
                     processedRows: state.processedRows,
@@ -435,6 +512,9 @@ const runLeadJob = async (options) => {
                 (state.candidateMissingCount || 0) +
                     (batch.length - finalCandidateRows);
         }
+        if (pending && !pendingBatchProcessed) {
+            throw new Error("Input ended before the saved enrichment batch could be recovered");
+        }
         // End-of-stream means every source row was processed. Closing the stream
         // waits for any pending writes before the terminal state is saved.
         throwIfCancelled();
@@ -442,10 +522,20 @@ const runLeadJob = async (options) => {
             output.end(() => resolve());
             output.once("error", reject);
         });
+        const outputFd = node_fs_1.default.openSync(options.outputPath, "r");
+        try {
+            node_fs_1.default.fsyncSync(outputFd);
+        }
+        finally {
+            node_fs_1.default.closeSync(outputFd);
+        }
         throwIfCancelled();
         state.totalRows = rowNumber;
         state.status = "completed";
         const completed = (0, state_1.saveJobState)(options.stateDir, state);
+        if (pending)
+            (0, pending_batch_1.completePendingBatch)(options.stateDir, pending);
+        pending = undefined;
         console.info("[lead-enrichment] job completed", {
             jobId: options.id,
             processedRows: state.processedRows,
@@ -499,7 +589,12 @@ const runLeadJob = async (options) => {
         // Provider, parser, filesystem, or output failures leave a terminal snapshot
         // so operators can see the cause without losing already-written lead rows.
         const message = error instanceof Error ? error.message : String(error);
-        if (/429|rate.?limit/i.test(message)) {
+        if (error instanceof verifier_client_1.VerifierOutcomeUnknownError) {
+            state.status = "paused";
+            state.pausedReason = exports.VERIFIER_REVIEW_REQUIRED;
+            state.pausedAt = new Date().toISOString();
+        }
+        else if (/429|rate.?limit/i.test(message)) {
             state.status = "paused";
             state.pausedReason = "Verifier provider quota or rate limit reached";
             state.pausedAt = new Date().toISOString();
@@ -516,7 +611,20 @@ const runLeadJob = async (options) => {
             error: message,
         });
         input.destroy();
-        output.destroy();
+        if (error instanceof verifier_client_1.VerifierOutcomeUnknownError && !output.writableEnded) {
+            try {
+                await new Promise((resolve, reject) => {
+                    output.once("error", reject);
+                    output.end(resolve);
+                });
+            }
+            catch (outputError) {
+                state.error += `; output close failed: ${outputError instanceof Error ? outputError.message : String(outputError)}`;
+            }
+        }
+        else {
+            output.destroy();
+        }
         const terminal = (0, state_1.saveJobState)(options.stateDir, state);
         (0, audit_1.appendAudit)({
             timestamp: new Date().toISOString(),

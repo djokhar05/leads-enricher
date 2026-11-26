@@ -37,6 +37,7 @@ export interface LeadJobState {
   processedRows: number;
   providerChecksCount: number;
   billableChecksCount: number;
+  billingUnknownCount?: number;
   settings?: LeadJobSettings;
   cacheHitCount?: number;
   retryCount?: number;
