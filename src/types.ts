@@ -51,6 +51,8 @@ export interface LeadJobState {
   suppressedCount?: number;
   currentStage?: "queued" | "reading" | "research" | "candidates" | "verification" | "writing" | "checkpoint" | "paused" | "completed";
   currentBatch?: number;
+  currentBatchStart?: number;
+  currentBatchEnd?: number;
   batchSize?: number;
   stageStartedAt?: string;
   stageUpdatedAt?: string;

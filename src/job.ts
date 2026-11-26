@@ -225,6 +225,27 @@ export const runLeadJob = async (
     },
   });
 
+  try {
+    let sourceRowCount = 0;
+    const countInput = fs.createReadStream(options.inputPath);
+    const countParser = countInput.pipe(
+      parse({
+        bom: true,
+        columns: true,
+        relax_column_count: true,
+        skip_empty_lines: true,
+      }),
+    );
+    for await (const _record of countParser as AsyncIterable<Record<string, string>>) {
+      sourceRowCount += 1;
+    }
+    state.totalRows = sourceRowCount;
+    state = saveJobState(options.stateDir, state);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    throw new Error(`Could not count input rows: ${message}`);
+  }
+
   let pending = loadPendingBatch(options.stateDir, options.id);
   let pendingBatchProcessed = false;
   if (pending && state.checkpointRow >= pending.endRow) {
@@ -425,6 +446,8 @@ export const runLeadJob = async (
       state.stageUpdatedAt = new Date().toISOString();
       state.currentBatch =
         (state.currentBatch || 0) + 1;
+      state.currentBatchStart = Math.max(rowNumber - batch.length + 1, 1);
+      state.currentBatchEnd = rowNumber;
       state = saveJobState(options.stateDir, state);
       const response = await verifyBatch(
         options.verifierBaseUrl,
@@ -615,7 +638,6 @@ export const runLeadJob = async (
         // locally, avoiding duplicate output on restart.
         state.processedRows = rowNumber;
         state.checkpointRow = rowNumber;
-        state.totalRows = rowNumber;
         const candidateRows = batch.filter(
           (lead) => (lead.rankedCandidates || []).length > 0,
         ).length;

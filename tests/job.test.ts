@@ -238,6 +238,7 @@ test("recovery reuses saved candidates and truncates uncommitted output", async 
   });
   assert.equal(result.status, "completed");
   assert.equal(result.currentStage, "completed");
+  assert.equal(result.totalRows, 2);
   assert.ok(result.startedAt);
   assert.deepEqual(submitted, ["recovery-stable-batch"]);
   const rows: Array<Record<string, string>> = parse(fs.readFileSync(outputPath), { columns: true });

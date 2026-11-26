@@ -171,6 +171,25 @@ const runLeadJob = async (options) => {
             excludeMissingEmail,
         },
     });
+    try {
+        let sourceRowCount = 0;
+        const countInput = node_fs_1.default.createReadStream(options.inputPath);
+        const countParser = countInput.pipe((0, csv_parse_1.parse)({
+            bom: true,
+            columns: true,
+            relax_column_count: true,
+            skip_empty_lines: true,
+        }));
+        for await (const _record of countParser) {
+            sourceRowCount += 1;
+        }
+        state.totalRows = sourceRowCount;
+        state = (0, state_1.saveJobState)(options.stateDir, state);
+    }
+    catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        throw new Error(`Could not count input rows: ${message}`);
+    }
     let pending = (0, pending_batch_1.loadPendingBatch)(options.stateDir, options.id);
     let pendingBatchProcessed = false;
     if (pending && state.checkpointRow >= pending.endRow) {
@@ -363,6 +382,8 @@ const runLeadJob = async (options) => {
             state.stageUpdatedAt = new Date().toISOString();
             state.currentBatch =
                 (state.currentBatch || 0) + 1;
+            state.currentBatchStart = Math.max(rowNumber - batch.length + 1, 1);
+            state.currentBatchEnd = rowNumber;
             state = (0, state_1.saveJobState)(options.stateDir, state);
             const response = await (0, verifier_client_1.verifyBatch)(options.verifierBaseUrl, options.verifierAuthToken, pending.requestId, options.provider, candidates, Math.max(options.providerCallLimit - state.providerChecksCount, 0), options.signal, options.skipUncertainChecks);
             if (response.status === "completed") {
@@ -518,7 +539,6 @@ const runLeadJob = async (options) => {
                 // locally, avoiding duplicate output on restart.
                 state.processedRows = rowNumber;
                 state.checkpointRow = rowNumber;
-                state.totalRows = rowNumber;
                 const candidateRows = batch.filter((lead) => (lead.rankedCandidates || []).length > 0).length;
                 state.candidateCount =
                     (state.candidateCount || 0) + candidateRows;
