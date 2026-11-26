@@ -74,11 +74,12 @@ export const enrichWithLlm = async (
     return null;
   }
   const prompt =
-    "Extract or infer the most likely owner, founder, or CEO full name for this business. " +
-    "Use team pages, about pages, contact pages, or search snippets. " +
-    "If no name is explicitly stated, infer from context clues (e.g. 'Founded by', 'Meet our team', 'Owner'). " +
+    "Extract only human first and last names explicitly associated with this business in the provided source text. " +
+    "Use team pages, about pages, leadership pages, contact pages, or source snippets. " +
+    "Do not infer an owner, founder, or CEO when no person name is stated. " +
+    "Do not return company names, job titles, departments, role addresses, or a name without a supporting source. " +
     "Return JSON: " +
-    '{"names":[{"firstName":"","lastName":"","confidence":0,"source":""}]}';
+    '{"names":[{"firstName":"","lastName":"","confidence":0,"source":"page or snippet that states the name"}]}';
 
   const parseNames = (content: string): string[] => {
     let names: string[] = [];

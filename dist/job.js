@@ -42,6 +42,72 @@ const matchesCompanyName = (name, company) => {
     const normalizedName = normalize(name.replace(/\s*\(Owner\)$/i, ""));
     return Boolean(normalizedName && normalizedName === normalize(company));
 };
+const roleWords = new Set([
+    "owner", "founder", "ceo", "team", "sales", "support", "admin",
+    "info", "contact", "marketing", "office", "service", "services",
+]);
+const isUsablePersonName = (name, companyName) => {
+    const cleaned = name.replace(/\s*\(Owner\)$/i, "").trim();
+    if (cleaned.length < 5 || matchesCompanyName(cleaned, companyName))
+        return false;
+    const words = cleaned.toLowerCase().split(/\s+/).filter(Boolean);
+    if (words.length < 2 || words.length > 5)
+        return false;
+    if (words.some((word) => roleWords.has(word.replace(/[^a-z]/g, ""))))
+        return false;
+    if (!/^[a-zA-Z][a-zA-Z.' -]+ [a-zA-Z][a-zA-Z.' -]+$/.test(cleaned))
+        return false;
+    return true;
+};
+const applyCachedDomainNames = (lead, domain, discoveredNames, options) => {
+    if ((lead.rankedCandidates || []).length > 0)
+        return;
+    const companyName = options?.companyNameColumn
+        ? (0, csv_1.valueFromRow)(lead.source, options.companyNameColumn)
+        : "";
+    const ownerName = options?.ownerNameColumn
+        ? String(lead.source[options.ownerNameColumn] || "").trim()
+        : options?.fullNameColumn
+            ? String(lead.source[options.fullNameColumn] || "").trim()
+            : "";
+    const names = [
+        ...new Set([
+            ...discoveredNames.map((name) => name.replace(/\s*\(Owner\)$/i, "").trim()),
+            ownerName && isUsablePersonName(ownerName, companyName)
+                ? ownerName.replace(/\s*\(Owner\)$/i, "").trim()
+                : "",
+        ].filter(Boolean)),
+    ];
+    if (names.length === 0) {
+        lead.verificationStatus = "not_deep_verified";
+        lead.verificationReason = "no_name_found";
+        return;
+    }
+    for (const fullName of names) {
+        const parts = fullName.trim().split(/\s+/).filter(Boolean);
+        if (parts.length < 2)
+            continue;
+        const aiRecord = {
+            ...lead.source,
+            __enriched_first_name: parts[0],
+            __enriched_last_name: parts.slice(1).join(" "),
+            __enriched_domain: domain,
+        };
+        const ranked = (0, csv_1.rankedCandidateEmails)(aiRecord, undefined, "__enriched_first_name", "__enriched_last_name", "__enriched_domain").map((candidate) => ({
+            ...candidate,
+            score: Math.max(candidate.score - 5, 20),
+            provenance: `ai+${candidate.provenance}`,
+        })).slice(0, 2);
+        if (ranked.length > 0) {
+            lead.rankedCandidates = ranked;
+            lead.candidateEmail = ranked[0].email;
+            lead.verificationStatus = "not_processed";
+            lead.verificationReason = undefined;
+            lead.provenance = [...lead.provenance, "ai-discovery"];
+            break;
+        }
+    }
+};
 // Runs one CSV job end to end. Processing is checkpointed after bounded batches
 // so provider counts, progress, and already-written output survive interruptions.
 const runLeadJob = async (options) => {
@@ -181,108 +247,56 @@ const runLeadJob = async (options) => {
             batch.splice(0, batch.length, ...pending.rows);
         }
         else if (options.llmEnabled) {
+            const domainLeads = new Map();
             for (const lead of batch) {
-                throwIfCancelled();
                 if ((lead.rankedCandidates || []).length > 0)
                     continue;
-                const domain = (0, csv_1.normalizeDomain)((options.domainColumn
-                    ? String(lead.source[options.domainColumn] || "")
-                    : "") ||
-                    (options.websiteColumn
-                        ? String(lead.source[options.websiteColumn] || "")
-                        : ""));
+                const domain = (0, csv_1.normalizeDomain)((options.domainColumn ? String(lead.source[options.domainColumn] || "") : "") ||
+                    (options.websiteColumn ? String(lead.source[options.websiteColumn] || "") : ""));
                 if (!domain)
                     continue;
+                const leads = domainLeads.get(domain) || [];
+                leads.push(lead);
+                domainLeads.set(domain, leads);
+            }
+            for (const [domain, leads] of domainLeads) {
+                throwIfCancelled();
+                const cached = (0, domain_cache_1.getDomainCache)(domain);
+                if (cached && typeof cached === "object") {
+                    const cachedNames = "names" in cached && Array.isArray(cached.names)
+                        ? cached.names.filter((name) => typeof name === "string")
+                        : [];
+                    for (const lead of leads)
+                        applyCachedDomainNames(lead, domain, cachedNames, options);
+                    continue;
+                }
+                const companyName = options.companyNameColumn
+                    ? (0, csv_1.valueFromRow)(leads[0].source, options.companyNameColumn)
+                    : "";
                 const research = (options.websiteResearchEnabled ?? true)
                     ? await (0, website_research_1.researchCompanyDomain)(domain, options.signal)
                     : null;
                 throwIfCancelled();
-                const companyName = options.companyNameColumn
-                    ? (0, csv_1.valueFromRow)(lead.source, options.companyNameColumn)
-                    : "";
                 const discovered = await (0, provider_adapters_1.enrichWithLlm)({
                     domain,
                     companyName: companyName || research?.title,
                     sourceUrl: research?.url,
                     sourceText: research?.text,
                 }, options.signal);
-                let effectiveDiscovery = discovered;
-                let effectiveResearch = research;
-                let aiTokenCount = discovered?.tokenCount || 0;
-                let aiCostEstimateUsd = discovered?.costEstimateUsd || 0;
-                if (!effectiveDiscovery?.names.length) {
-                    // Search engine fallback skipped — Google/Bing/DuckDuckGo block scrapers
-                    // and rarely return useful text, wasting tokens without improving hit rate.
+                const discoveredNames = (discovered?.names || []).filter((name) => isUsablePersonName(name, companyName));
+                (0, domain_cache_1.setDomainCache)(domain, { names: discoveredNames, verifiedAt: Date.now() }, 24 * 60 * 60 * 1000);
+                if (discovered) {
+                    state.tokenCount = (state.tokenCount || 0) + discovered.tokenCount;
+                    state.costEstimateUsd = (state.costEstimateUsd || 0) + discovered.costEstimateUsd;
                 }
-                if (!effectiveDiscovery)
-                    continue;
-                state.tokenCount =
-                    (state.tokenCount || 0) + aiTokenCount;
-                state.costEstimateUsd =
-                    (state.costEstimateUsd || 0) +
-                        aiCostEstimateUsd;
-                throwIfCancelled();
                 console.info("[lead-enrichment] AI discovery result", {
                     jobId: options.id,
                     domain,
-                    companyName: lead.source[options.companyNameColumn || ""] || "",
-                    discoveredNames: effectiveDiscovery.names,
+                    companyName,
+                    discoveredNames,
                 });
-                const ownerName = options.ownerNameColumn
-                    ? String(lead.source[options.ownerNameColumn] || "").trim()
-                    : options.fullNameColumn
-                        ? String(lead.source[options.fullNameColumn] || "").trim()
-                        : "";
-                const fallbackOwnerName = ownerName && ownerName.length >= 3
-                    ? ownerName.replace(/\s*\(Owner\)$/i, "").trim()
-                    : "";
-                const discoverableNames = [
-                    ...new Set([
-                        ...effectiveDiscovery.names,
-                        fallbackOwnerName,
-                    ].filter((name) => name && !matchesCompanyName(name, companyName))),
-                ];
-                for (const fullName of discoverableNames) {
-                    const parts = fullName
-                        .trim()
-                        .split(/\s+/)
-                        .filter(Boolean);
-                    if (parts.length < 2)
-                        continue;
-                    const firstName = parts[0];
-                    const lastName = parts.slice(1).join(" ");
-                    const aiRecord = {
-                        ...lead.source,
-                        __enriched_first_name: firstName,
-                        __enriched_last_name: lastName,
-                        __enriched_domain: domain,
-                    };
-                    const ranked = (0, csv_1.rankedCandidateEmails)(aiRecord, undefined, "__enriched_first_name", "__enriched_last_name", "__enriched_domain").map((candidate) => candidate.provenance.startsWith("candidate-pattern")
-                        ? {
-                            ...candidate,
-                            score: Math.max(candidate.score - 5, 20),
-                            provenance: `ai+${candidate.provenance}`,
-                        }
-                        : candidate);
-                    if (ranked.length > 0) {
-                        lead.rankedCandidates = ranked;
-                        lead.candidateEmail = ranked[0].email;
-                        console.info("[lead-enrichment] AI candidate generated", {
-                            jobId: options.id,
-                            rowId: lead.rowId,
-                            discoveredName: fullName,
-                            candidateEmail: ranked[0].email,
-                            domain,
-                        });
-                        lead.provenance = [
-                            ...lead.provenance,
-                            effectiveResearch
-                                ? `llm:${effectiveResearch.url}`
-                                : "llm:explicit-source",
-                        ];
-                        break;
-                    }
-                }
+                for (const lead of leads)
+                    applyCachedDomainNames(lead, domain, discoveredNames, options);
             }
         }
         throwIfCancelled();
@@ -316,7 +330,14 @@ const runLeadJob = async (options) => {
         if (candidates.length === 0) {
             for (const lead of batch) {
                 lead.verificationStatus = "not_deep_verified";
-                lead.verificationReason = "No candidate email could be generated";
+                lead.verificationReason =
+                    lead.verificationReason === "no_name_found"
+                        ? "no_name_found"
+                        : lead.source[options.domainColumn ||
+                            options.websiteColumn ||
+                            ""]
+                            ? "no_candidate_generated"
+                            : "no_domain_found";
                 lead.verificationDomain = undefined;
             }
         }
@@ -442,9 +463,11 @@ const runLeadJob = async (options) => {
                 const lastName = sourceLastName || fullName.lastName;
                 const companyName = (0, csv_1.valueFromRow)(record, options.companyNameColumn);
                 if (matchesCompanyName(`${firstName} ${lastName}`, companyName) ||
-                    (!sourceFirstName && !sourceLastName && matchesCompanyName(sourceFullName, companyName))) {
+                    (!sourceFirstName && !sourceLastName && matchesCompanyName(sourceFullName, companyName)) ||
+                    !isUsablePersonName(`${firstName} ${lastName}`.trim(), companyName)) {
                     rankedCandidates = [];
                 }
+                rankedCandidates = rankedCandidates.slice(0, 2);
             }
             const suppressed = rankedCandidates.some((candidate) => (0, suppressions_1.isSuppressed)(candidate.email));
             if (rankedCandidates.length > 0)
