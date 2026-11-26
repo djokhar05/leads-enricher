@@ -52,6 +52,7 @@ const runLeadJob = async (options) => {
         ...options,
         ...options.initialState?.settings,
         excludeMissingEmail,
+        skipUncertainChecks: options.initialState?.settings?.skipUncertainChecks ?? options.skipUncertainChecks ?? false,
     };
     console.info("[lead-enrichment] job processing started", {
         jobId: options.id,
@@ -323,7 +324,7 @@ const runLeadJob = async (options) => {
             // Remaining job budget is calculated here so each batch cannot overspend
             // the operator's configured enrichment provider-call limit.
             // The batch response is authoritative for both provider counts and outcomes.
-            const response = await (0, verifier_client_1.verifyBatch)(options.verifierBaseUrl, options.verifierAuthToken, pending.requestId, options.provider, candidates, Math.max(options.providerCallLimit - state.providerChecksCount, 0), options.signal);
+            const response = await (0, verifier_client_1.verifyBatch)(options.verifierBaseUrl, options.verifierAuthToken, pending.requestId, options.provider, candidates, Math.max(options.providerCallLimit - state.providerChecksCount, 0), options.signal, options.skipUncertainChecks);
             if (response.status === "completed") {
                 pending.verifierCompleted = true;
                 (0, pending_batch_1.savePendingBatch)(options.stateDir, pending);

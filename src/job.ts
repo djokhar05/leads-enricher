@@ -46,6 +46,7 @@ export interface StartLeadJobOptions {
   llmEnabled?: boolean;
   websiteResearchEnabled?: boolean;
   excludeMissingEmail?: boolean;
+  skipUncertainChecks?: boolean;
   initialState?: LeadJobState;
   cancelRequested?: () => boolean;
   signal?: AbortSignal;
@@ -93,6 +94,7 @@ export const runLeadJob = async (
     ...options,
     ...options.initialState?.settings,
     excludeMissingEmail,
+    skipUncertainChecks: options.initialState?.settings?.skipUncertainChecks ?? options.skipUncertainChecks ?? false,
   };
   console.info("[lead-enrichment] job processing started", {
     jobId: options.id,
@@ -393,6 +395,7 @@ export const runLeadJob = async (
           0,
         ),
         options.signal,
+          options.skipUncertainChecks,
       );
       if (response.status === "completed") {
         pending.verifierCompleted = true;

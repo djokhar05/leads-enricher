@@ -44,7 +44,7 @@ const isValidResult = (value, requestId, provider, emails) => {
         return false;
     return true;
 };
-const verifyBatch = async (baseUrl, authToken, requestId, provider, emails, maxProviderCalls, signal) => {
+const verifyBatch = async (baseUrl, authToken, requestId, provider, emails, maxProviderCalls, signal, skipUncertainChecks = false) => {
     signal?.throwIfAborted();
     const base = `${baseUrl.replace(/\/$/, "")}/api/batches`;
     const endpoint = `${base}/${encodeURIComponent(requestId)}`;
@@ -139,6 +139,29 @@ const verifyBatch = async (baseUrl, authToken, requestId, provider, emails, maxP
         }
         if (!isValidResult(result, requestId, provider, emails)) {
             throw new VerifierOutcomeUnknownError(`Verifier returned invalid status for batch ${requestId}`);
+        }
+        if (skipUncertainChecks && result.status === "paused") {
+            try {
+                const reviewResponse = await fetch(`${endpoint}/review`, { headers, signal: AbortSignal.timeout(10_000) });
+                if (!reviewResponse.ok)
+                    throw new Error(`Review endpoint returned HTTP ${reviewResponse.status}`);
+                const review = await reviewResponse.json();
+                if (!isRecord(review) || typeof review.token !== "string" || !review.token) {
+                    throw new Error("Verifier did not return a valid review token");
+                }
+                const decision = await fetch(`${endpoint}/review`, {
+                    method: "POST",
+                    headers,
+                    body: JSON.stringify({ token: review.token, action: "skip", confirmDuplicateCharge: false }),
+                    signal: AbortSignal.timeout(10_000),
+                });
+                if (!decision.ok)
+                    throw new Error(`Verifier rejected skip review (HTTP ${decision.status})`);
+                continue;
+            }
+            catch (error) {
+                throw new VerifierOutcomeUnknownError(`Could not apply skip-all policy to batch ${requestId}: ${error instanceof Error ? error.message : String(error)}`);
+            }
         }
         if (result.status === "paused" || result.status === "failed") {
             throw new VerifierOutcomeUnknownError(`Batch ${requestId} requires review: ${result.error || result.status}`);

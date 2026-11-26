@@ -73,6 +73,7 @@ export const verifyBatch = async (
   emails: string[],
   maxProviderCalls: number,
   signal?: AbortSignal,
+  skipUncertainChecks = false,
 ): Promise<BatchResponse> => {
   signal?.throwIfAborted();
   const base = `${baseUrl.replace(/\/$/, "")}/api/batches`;
@@ -172,6 +173,28 @@ export const verifyBatch = async (
     }
     if (!isValidResult(result, requestId, provider, emails)) {
       throw new VerifierOutcomeUnknownError(`Verifier returned invalid status for batch ${requestId}`);
+    }
+    if (skipUncertainChecks && result.status === "paused") {
+      try {
+        const reviewResponse = await fetch(`${endpoint}/review`, { headers, signal: AbortSignal.timeout(10_000) });
+        if (!reviewResponse.ok) throw new Error(`Review endpoint returned HTTP ${reviewResponse.status}`);
+        const review = await reviewResponse.json() as unknown;
+        if (!isRecord(review) || typeof review.token !== "string" || !review.token) {
+          throw new Error("Verifier did not return a valid review token");
+        }
+        const decision = await fetch(`${endpoint}/review`, {
+          method: "POST",
+          headers,
+          body: JSON.stringify({ token: review.token, action: "skip", confirmDuplicateCharge: false }),
+          signal: AbortSignal.timeout(10_000),
+        });
+        if (!decision.ok) throw new Error(`Verifier rejected skip review (HTTP ${decision.status})`);
+        continue;
+      } catch (error) {
+        throw new VerifierOutcomeUnknownError(
+          `Could not apply skip-all policy to batch ${requestId}: ${error instanceof Error ? error.message : String(error)}`,
+        );
+      }
     }
     if (result.status === "paused" || result.status === "failed") {
       throw new VerifierOutcomeUnknownError(

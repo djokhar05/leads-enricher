@@ -21,6 +21,7 @@ export interface LeadJobSettings {
   fullNameColumn?: string;
   llmEnabled?: boolean;
   websiteResearchEnabled?: boolean;
+  skipUncertainChecks?: boolean;
   excludeMissingEmail: boolean;
 }
 

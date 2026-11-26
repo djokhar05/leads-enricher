@@ -200,6 +200,11 @@ exports.app.post("/jobs", (req, res) => {
         res.status(400).json({ error: "excludeMissingEmail must be a boolean" });
         return;
     }
+    if (body.skipUncertainChecks !== undefined &&
+        typeof body.skipUncertainChecks !== "boolean") {
+        res.status(400).json({ error: "skipUncertainChecks must be a boolean" });
+        return;
+    }
     if (!body.inputPath) {
         res.status(400).json({ error: "inputPath is required" });
         return;
@@ -270,6 +275,7 @@ exports.app.post("/jobs", (req, res) => {
             ? body.websiteResearchEnabled
             : config_1.config.llmWebsiteResearchEnabled,
         excludeMissingEmail: body.excludeMissingEmail ?? true,
+        skipUncertainChecks: body.skipUncertainChecks ?? false,
     };
     const initial = {
         id,
@@ -465,6 +471,7 @@ exports.app.post("/jobs/:jobId/review", async (req, res) => {
     const pending = (0, pending_batch_1.loadPendingBatch)(stateDir, jobId);
     const token = req.body?.token;
     const action = req.body?.action;
+    const skipAllUncertain = req.body?.skipAllUncertain === true;
     if (!pending || typeof token !== "string" || !token || !["skip", "retry"].includes(String(action)) ||
         (action === "retry" && req.body?.confirmDuplicateCharge !== true)) {
         res.status(400).json({ error: "A pending batch, review token and action are required; retry also requires duplicate-charge confirmation" });
@@ -494,8 +501,12 @@ exports.app.post("/jobs/:jobId/review", async (req, res) => {
             return;
         }
         if (["queued", "processing", "completed", "cancelled"].includes(payload.status)) {
+            const settings = job.settings
+                ? { ...job.settings, skipUncertainChecks: action === "skip" && skipAllUncertain }
+                : job.settings;
             const resumed = (0, state_1.saveJobState)(stateDir, {
                 ...job,
+                settings,
                 status: "queued",
                 cancelRequested: false,
                 pausedReason: undefined,
@@ -508,7 +519,11 @@ exports.app.post("/jobs/:jobId/review", async (req, res) => {
                 action: "lead_enrichment.job.resumed",
                 jobId,
                 status: "success",
-                metadata: { after: "batch_review" },
+                metadata: {
+                    after: "batch_review",
+                    decision: action,
+                    skipAllUncertain,
+                },
             });
             startTrackedJob({
                 id: resumed.id,
@@ -523,6 +538,7 @@ exports.app.post("/jobs/:jobId/review", async (req, res) => {
                 initialState: resumed,
                 llmEnabled: resumed.settings?.llmEnabled ?? config_1.config.llmEnabled,
                 websiteResearchEnabled: resumed.settings?.websiteResearchEnabled ?? config_1.config.llmWebsiteResearchEnabled,
+                skipUncertainChecks: resumed.settings?.skipUncertainChecks ?? false,
             });
         }
         (0, audit_1.appendAudit)({
