@@ -494,10 +494,35 @@ exports.app.post("/jobs/:jobId/review", async (req, res) => {
             return;
         }
         if (["queued", "processing", "completed", "cancelled"].includes(payload.status)) {
-            (0, state_1.saveJobState)(stateDir, {
+            const resumed = (0, state_1.saveJobState)(stateDir, {
                 ...job,
-                pausedReason: "Verifier batch reviewed; ready to resume",
+                status: "queued",
+                cancelRequested: false,
+                pausedReason: undefined,
+                pausedAt: undefined,
                 error: undefined,
+            });
+            (0, audit_1.appendAudit)({
+                timestamp: new Date().toISOString(),
+                hostId: config_1.config.hostId,
+                action: "lead_enrichment.job.resumed",
+                jobId,
+                status: "success",
+                metadata: { after: "batch_review" },
+            });
+            startTrackedJob({
+                id: resumed.id,
+                inputPath: resumed.inputPath,
+                outputPath: resumed.outputPath,
+                stateDir,
+                provider: resumed.provider,
+                providerCallLimit: resumed.settings?.providerCallLimit ?? config_1.config.providerCallLimit,
+                batchSize: resumed.settings?.batchSize ?? config_1.config.batchSize,
+                verifierBaseUrl,
+                verifierAuthToken,
+                initialState: resumed,
+                llmEnabled: resumed.settings?.llmEnabled ?? config_1.config.llmEnabled,
+                websiteResearchEnabled: resumed.settings?.websiteResearchEnabled ?? config_1.config.llmWebsiteResearchEnabled,
             });
         }
         (0, audit_1.appendAudit)({
@@ -532,7 +557,7 @@ exports.app.post("/jobs/:jobId/resume", async (req, res) => {
         res.status(409).json({ error: "Only paused, failed, or cancelled jobs can resume" });
         return;
     }
-    if (existing.pausedReason === job_1.VERIFIER_REVIEW_REQUIRED) {
+    if ((0, pending_batch_1.loadPendingBatch)(stateDir, jobId)) {
         const pending = (0, pending_batch_1.loadPendingBatch)(stateDir, jobId);
         if (!pending) {
             res.status(409).json({ error: "The pending verifier batch is missing; operator review is required" });

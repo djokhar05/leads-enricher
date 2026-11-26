@@ -58,6 +58,7 @@ class JobCancelledError extends Error {
 }
 
 export const VERIFIER_REVIEW_REQUIRED = "Verifier outcome requires operator review";
+export const VERIFIER_REVIEW_READY = "Verifier batch reviewed; ready to resume";
 
 const outputColumns = [
   "lead_row_id",

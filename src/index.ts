@@ -3,7 +3,12 @@ import fs from "node:fs";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import multer from "multer";
-import { runLeadJob, VERIFIER_REVIEW_REQUIRED, type StartLeadJobOptions } from "./job";
+import {
+  runLeadJob,
+  VERIFIER_REVIEW_REQUIRED,
+  VERIFIER_REVIEW_READY,
+  type StartLeadJobOptions,
+} from "./job";
 import { ensureDir, loadJobStates, saveJobState } from "./state";
 import { loadPendingBatch, reconcileBatchAcknowledgements } from "./pending-batch";
 import type { LeadJobState } from "./types";
@@ -539,10 +544,35 @@ app.post("/jobs/:jobId/review", async (req, res) => {
       return;
     }
     if (["queued", "processing", "completed", "cancelled"].includes(payload.status)) {
-      saveJobState(stateDir, {
+      const resumed = saveJobState(stateDir, {
         ...job,
-        pausedReason: "Verifier batch reviewed; ready to resume",
+        status: "queued",
+        cancelRequested: false,
+        pausedReason: undefined,
+        pausedAt: undefined,
         error: undefined,
+      });
+      appendAudit({
+        timestamp: new Date().toISOString(),
+        hostId: config.hostId,
+        action: "lead_enrichment.job.resumed",
+        jobId,
+        status: "success",
+        metadata: { after: "batch_review" },
+      });
+      startTrackedJob({
+        id: resumed.id,
+        inputPath: resumed.inputPath,
+        outputPath: resumed.outputPath,
+        stateDir,
+        provider: resumed.provider,
+        providerCallLimit: resumed.settings?.providerCallLimit ?? config.providerCallLimit,
+        batchSize: resumed.settings?.batchSize ?? config.batchSize,
+        verifierBaseUrl,
+        verifierAuthToken,
+        initialState: resumed,
+        llmEnabled: resumed.settings?.llmEnabled ?? config.llmEnabled,
+        websiteResearchEnabled: resumed.settings?.websiteResearchEnabled ?? config.llmWebsiteResearchEnabled,
       });
     }
     appendAudit({
@@ -577,7 +607,7 @@ app.post("/jobs/:jobId/resume", async (req, res) => {
     res.status(409).json({ error: "Only paused, failed, or cancelled jobs can resume" });
     return;
   }
-  if (existing.pausedReason === VERIFIER_REVIEW_REQUIRED) {
+  if (loadPendingBatch(stateDir, jobId)) {
     const pending = loadPendingBatch(stateDir, jobId);
     if (!pending) {
       res.status(409).json({ error: "The pending verifier batch is missing; operator review is required" });

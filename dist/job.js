@@ -3,7 +3,7 @@ var __importDefault = (this && this.__importDefault) || function (mod) {
     return (mod && mod.__esModule) ? mod : { "default": mod };
 };
 Object.defineProperty(exports, "__esModule", { value: true });
-exports.runLeadJob = exports.VERIFIER_REVIEW_REQUIRED = void 0;
+exports.runLeadJob = exports.VERIFIER_REVIEW_READY = exports.VERIFIER_REVIEW_REQUIRED = void 0;
 const node_fs_1 = __importDefault(require("node:fs"));
 const node_path_1 = __importDefault(require("node:path"));
 const node_crypto_1 = require("node:crypto");
@@ -24,6 +24,7 @@ class JobCancelledError extends Error {
     }
 }
 exports.VERIFIER_REVIEW_REQUIRED = "Verifier outcome requires operator review";
+exports.VERIFIER_REVIEW_READY = "Verifier batch reviewed; ready to resume";
 const outputColumns = [
     "lead_row_id",
     "candidate_email",
