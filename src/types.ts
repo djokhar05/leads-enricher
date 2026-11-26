@@ -49,6 +49,13 @@ export interface LeadJobState {
   candidateCount?: number;
   candidateMissingCount?: number;
   suppressedCount?: number;
+  currentStage?: "queued" | "reading" | "research" | "candidates" | "verification" | "writing" | "checkpoint" | "paused" | "completed";
+  currentBatch?: number;
+  batchSize?: number;
+  stageStartedAt?: string;
+  stageUpdatedAt?: string;
+  startedAt?: string;
+  lastCheckpointAt?: string;
   cancelRequested?: boolean;
   inputDeleted?: boolean;
   outputDeleted?: boolean;

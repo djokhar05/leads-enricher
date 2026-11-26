@@ -149,6 +149,11 @@ const runLeadJob = async (options) => {
     state = (0, state_1.saveJobState)(options.stateDir, {
         ...state,
         status: "processing",
+        startedAt: options.initialState?.startedAt || new Date().toISOString(),
+        currentStage: "reading",
+        stageStartedAt: new Date().toISOString(),
+        stageUpdatedAt: new Date().toISOString(),
+        batchSize: options.batchSize,
         settings: {
             providerCallLimit: options.providerCallLimit,
             batchSize: options.batchSize,
@@ -261,6 +266,9 @@ const runLeadJob = async (options) => {
             }
             for (const [domain, leads] of domainLeads) {
                 throwIfCancelled();
+                state.currentStage = "research";
+                state.stageUpdatedAt = new Date().toISOString();
+                state = (0, state_1.saveJobState)(options.stateDir, state);
                 const cached = (0, domain_cache_1.getDomainCache)(domain);
                 if (cached && typeof cached === "object") {
                     const cachedNames = "names" in cached && Array.isArray(cached.names)
@@ -345,6 +353,11 @@ const runLeadJob = async (options) => {
             // Remaining job budget is calculated here so each batch cannot overspend
             // the operator's configured enrichment provider-call limit.
             // The batch response is authoritative for both provider counts and outcomes.
+            state.currentStage = "verification";
+            state.stageUpdatedAt = new Date().toISOString();
+            state.currentBatch =
+                (state.currentBatch || 0) + 1;
+            state = (0, state_1.saveJobState)(options.stateDir, state);
             const response = await (0, verifier_client_1.verifyBatch)(options.verifierBaseUrl, options.verifierAuthToken, pending.requestId, options.provider, candidates, Math.max(options.providerCallLimit - state.providerChecksCount, 0), options.signal, options.skipUncertainChecks);
             if (response.status === "completed") {
                 pending.verifierCompleted = true;
@@ -510,6 +523,9 @@ const runLeadJob = async (options) => {
                     (state.suppressedCount || 0) +
                         batch.filter((lead) => lead.rankedCandidates?.some((candidate) => (0, suppressions_1.isSuppressed)(candidate.email))).length;
                 batch = [];
+                state.currentStage = "checkpoint";
+                state.stageUpdatedAt = new Date().toISOString();
+                state.lastCheckpointAt = new Date().toISOString();
                 state = (0, state_1.saveJobState)(options.stateDir, state);
                 if (pending)
                     (0, pending_batch_1.completePendingBatch)(options.stateDir, pending);
@@ -557,6 +573,8 @@ const runLeadJob = async (options) => {
         throwIfCancelled();
         state.totalRows = rowNumber;
         state.status = "completed";
+        state.currentStage = "completed";
+        state.stageUpdatedAt = new Date().toISOString();
         const completed = (0, state_1.saveJobState)(options.stateDir, state);
         if (pending)
             (0, pending_batch_1.completePendingBatch)(options.stateDir, pending);
@@ -616,11 +634,13 @@ const runLeadJob = async (options) => {
         const message = error instanceof Error ? error.message : String(error);
         if (error instanceof verifier_client_1.VerifierOutcomeUnknownError) {
             state.status = "paused";
+            state.currentStage = "paused";
             state.pausedReason = exports.VERIFIER_REVIEW_REQUIRED;
             state.pausedAt = new Date().toISOString();
         }
         else if (/429|rate.?limit/i.test(message)) {
             state.status = "paused";
+            state.currentStage = "paused";
             state.pausedReason = "Verifier provider quota or rate limit reached";
             state.pausedAt = new Date().toISOString();
         }

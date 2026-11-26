@@ -202,6 +202,11 @@ export const runLeadJob = async (
   state = saveJobState(options.stateDir, {
     ...state,
     status: "processing",
+    startedAt: options.initialState?.startedAt || new Date().toISOString(),
+    currentStage: "reading",
+    stageStartedAt: new Date().toISOString(),
+    stageUpdatedAt: new Date().toISOString(),
+    batchSize: options.batchSize,
     settings: {
       providerCallLimit: options.providerCallLimit,
       batchSize: options.batchSize,
@@ -317,6 +322,9 @@ export const runLeadJob = async (
       }
       for (const [domain, leads] of domainLeads) {
         throwIfCancelled();
+        state.currentStage = "research";
+        state.stageUpdatedAt = new Date().toISOString();
+        state = saveJobState(options.stateDir, state);
         const cached = getDomainCache(domain);
         if (cached && typeof cached === "object") {
           const cachedNames = "names" in cached && Array.isArray(cached.names)
@@ -407,6 +415,11 @@ export const runLeadJob = async (
       // Remaining job budget is calculated here so each batch cannot overspend
       // the operator's configured enrichment provider-call limit.
       // The batch response is authoritative for both provider counts and outcomes.
+      state.currentStage = "verification";
+      state.stageUpdatedAt = new Date().toISOString();
+      state.currentBatch =
+        (state.currentBatch || 0) + 1;
+      state = saveJobState(options.stateDir, state);
       const response = await verifyBatch(
         options.verifierBaseUrl,
         options.verifierAuthToken,
@@ -613,6 +626,9 @@ export const runLeadJob = async (
             ),
           ).length;
         batch = [];
+        state.currentStage = "checkpoint";
+        state.stageUpdatedAt = new Date().toISOString();
+        state.lastCheckpointAt = new Date().toISOString();
         state = saveJobState(options.stateDir, state);
         if (pending) completePendingBatch(options.stateDir, pending);
         pending = undefined;
@@ -661,6 +677,8 @@ export const runLeadJob = async (
     throwIfCancelled();
     state.totalRows = rowNumber;
     state.status = "completed";
+    state.currentStage = "completed";
+    state.stageUpdatedAt = new Date().toISOString();
     const completed = saveJobState(options.stateDir, state);
     if (pending) completePendingBatch(options.stateDir, pending);
     pending = undefined;
@@ -721,10 +739,12 @@ export const runLeadJob = async (
       error instanceof Error ? error.message : String(error);
     if (error instanceof VerifierOutcomeUnknownError) {
       state.status = "paused";
+      state.currentStage = "paused";
       state.pausedReason = VERIFIER_REVIEW_REQUIRED;
       state.pausedAt = new Date().toISOString();
     } else if (/429|rate.?limit/i.test(message)) {
       state.status = "paused";
+      state.currentStage = "paused";
       state.pausedReason = "Verifier provider quota or rate limit reached";
       state.pausedAt = new Date().toISOString();
     } else {

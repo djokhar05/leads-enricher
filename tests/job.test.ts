@@ -237,6 +237,8 @@ test("recovery reuses saved candidates and truncates uncommitted output", async 
     verifierAuthToken: "", emailColumn: "email", initialState,
   });
   assert.equal(result.status, "completed");
+  assert.equal(result.currentStage, "completed");
+  assert.ok(result.startedAt);
   assert.deepEqual(submitted, ["recovery-stable-batch"]);
   const rows: Array<Record<string, string>> = parse(fs.readFileSync(outputPath), { columns: true });
   assert.deepEqual(rows.map((entry) => entry.email), ["first@example.com", "second@example.com"]);
