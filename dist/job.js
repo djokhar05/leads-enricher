@@ -244,6 +244,9 @@ const runLeadJob = async (options) => {
         }
     };
     const emitBatch = async (batch) => {
+        state.currentStage = "writing";
+        state.stageUpdatedAt = new Date().toISOString();
+        state = (0, state_1.saveJobState)(options.stateDir, state);
         if (pending) {
             if (pending.endRow !== rowNumber || pending.rows.length !== batch.length ||
                 pending.rows.some((row, index) => row.rowId !== batch[index].rowId)) {
@@ -252,6 +255,9 @@ const runLeadJob = async (options) => {
             batch.splice(0, batch.length, ...pending.rows);
         }
         else if (options.llmEnabled) {
+            state.currentStage = "candidates";
+            state.stageUpdatedAt = new Date().toISOString();
+            state = (0, state_1.saveJobState)(options.stateDir, state);
             const domainLeads = new Map();
             for (const lead of batch) {
                 if ((lead.rankedCandidates || []).length > 0)
