@@ -159,7 +159,37 @@ exports.app.post("/ai/test", async (_req, res) => {
     const result = await (0, provider_adapters_1.testLlmConnection)();
     res.status(result.ok ? 200 : 503).json(result);
 });
-exports.app.get("/jobs", (_req, res) => {
+exports.app.get("/jobs", async (_req, res) => {
+    const jobs = (0, state_1.loadJobStates)(stateDir);
+    for (const job of jobs) {
+        if (!["queued", "processing", "paused"].includes(job.status))
+            continue;
+        const pending = (0, pending_batch_1.loadPendingBatch)(stateDir, job.id);
+        if (!pending)
+            continue;
+        try {
+            const response = await fetch(`${verifierBaseUrl.replace(/\/$/, "")}/api/batches/${encodeURIComponent(pending.requestId)}`, {
+                headers: verifierAuthToken ? { Authorization: `Bearer ${verifierAuthToken}` } : {},
+                signal: AbortSignal.timeout(5_000),
+            });
+            if (!response.ok)
+                continue;
+            const batch = await response.json();
+            if (batch.status === "paused") {
+                (0, state_1.saveJobState)(stateDir, {
+                    ...job,
+                    status: "paused",
+                    currentStage: "paused",
+                    pausedReason: job_1.VERIFIER_REVIEW_REQUIRED,
+                    pausedAt: new Date().toISOString(),
+                    error: "Provider check outcome and billing are unknown; operator review required",
+                });
+            }
+        }
+        catch {
+            // Do not change durable job state when the verifier is temporarily unreachable.
+        }
+    }
     res.json({ jobs: (0, state_1.loadJobStates)(stateDir) });
 });
 // Look up one persisted job and its latest checkpoint/progress.

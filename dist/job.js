@@ -385,17 +385,30 @@ const runLeadJob = async (options) => {
             state.currentBatchStart = Math.max(rowNumber - batch.length + 1, 1);
             state.currentBatchEnd = rowNumber;
             state = (0, state_1.saveJobState)(options.stateDir, state);
-            const response = await (0, verifier_client_1.verifyBatch)(options.verifierBaseUrl, options.verifierAuthToken, pending.requestId, options.provider, candidates, Math.max(options.providerCallLimit - state.providerChecksCount, 0), options.signal, options.skipUncertainChecks);
+            const providerChecksBase = state.providerChecksCount;
+            const billableChecksBase = state.billableChecksCount;
+            const billingUnknownBase = state.billingUnknownCount || 0;
+            const cacheHitBase = state.cacheHitCount || 0;
+            const response = await (0, verifier_client_1.verifyBatch)(options.verifierBaseUrl, options.verifierAuthToken, pending.requestId, options.provider, candidates, Math.max(options.providerCallLimit - state.providerChecksCount, 0), options.signal, options.skipUncertainChecks, (batchStatus) => {
+                state.providerChecksCount = providerChecksBase + batchStatus.providerChecksCount;
+                state.billableChecksCount = billableChecksBase + batchStatus.billableChecksCount;
+                state.billingUnknownCount = billingUnknownBase + (batchStatus.billingUnknownCount || 0);
+                state.cacheHitCount = cacheHitBase + batchStatus.cacheHitCount;
+                state.currentStage =
+                    batchStatus.status === "paused" ? "paused" : "verification";
+                state.stageUpdatedAt = new Date().toISOString();
+                state = (0, state_1.saveJobState)(options.stateDir, state);
+            });
             if (response.status === "completed") {
                 pending.verifierCompleted = true;
                 (0, pending_batch_1.savePendingBatch)(options.stateDir, pending);
             }
-            state.providerChecksCount += response.providerChecksCount;
-            state.billableChecksCount += response.billableChecksCount;
+            state.providerChecksCount = providerChecksBase + response.providerChecksCount;
+            state.billableChecksCount = billableChecksBase + response.billableChecksCount;
             state.billingUnknownCount =
-                (state.billingUnknownCount || 0) + (response.billingUnknownCount || 0);
+                billingUnknownBase + (response.billingUnknownCount || 0);
             state.cacheHitCount =
-                (state.cacheHitCount || 0) + response.cacheHitCount;
+                cacheHitBase + response.cacheHitCount;
             throwIfCancelled();
             // Match verifier responses by candidate address for in-memory batch joining.
             // Keep the verifier result separate from source identity; row linkage is retained

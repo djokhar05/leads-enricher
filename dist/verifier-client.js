@@ -44,7 +44,7 @@ const isValidResult = (value, requestId, provider, emails) => {
         return false;
     return true;
 };
-const verifyBatch = async (baseUrl, authToken, requestId, provider, emails, maxProviderCalls, signal, skipUncertainChecks = false) => {
+const verifyBatch = async (baseUrl, authToken, requestId, provider, emails, maxProviderCalls, signal, skipUncertainChecks = false, onStatus) => {
     signal?.throwIfAborted();
     const base = `${baseUrl.replace(/\/$/, "")}/api/batches`;
     const endpoint = `${base}/${encodeURIComponent(requestId)}`;
@@ -55,6 +55,7 @@ const verifyBatch = async (baseUrl, authToken, requestId, provider, emails, maxP
     let submitted = false;
     let cancellationSent = false;
     let connectionFailures = 0;
+    let lastStatusUpdate = 0;
     for (;;) {
         if (signal?.aborted && !submitted) {
             throw new VerifierOutcomeUnknownError(`Submission of batch ${requestId} could not be confirmed; provider checks may still be running`);
@@ -139,6 +140,11 @@ const verifyBatch = async (baseUrl, authToken, requestId, provider, emails, maxP
         }
         if (!isValidResult(result, requestId, provider, emails)) {
             throw new VerifierOutcomeUnknownError(`Verifier returned invalid status for batch ${requestId}`);
+        }
+        const now = Date.now();
+        if (now - lastStatusUpdate >= 2_000) {
+            lastStatusUpdate = now;
+            onStatus?.(result);
         }
         if (skipUncertainChecks && result.status === "paused") {
             try {

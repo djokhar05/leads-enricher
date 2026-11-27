@@ -156,7 +156,36 @@ app.post("/ai/test", async (_req, res) => {
   res.status(result.ok ? 200 : 503).json(result);
 });
 
-app.get("/jobs", (_req, res) => {
+app.get("/jobs", async (_req, res) => {
+  const jobs = loadJobStates(stateDir);
+  for (const job of jobs) {
+    if (!["queued", "processing", "paused"].includes(job.status)) continue;
+    const pending = loadPendingBatch(stateDir, job.id);
+    if (!pending) continue;
+    try {
+      const response = await fetch(
+        `${verifierBaseUrl.replace(/\/$/, "")}/api/batches/${encodeURIComponent(pending.requestId)}`,
+        {
+          headers: verifierAuthToken ? { Authorization: `Bearer ${verifierAuthToken}` } : {},
+          signal: AbortSignal.timeout(5_000),
+        },
+      );
+      if (!response.ok) continue;
+      const batch = await response.json() as { status?: string };
+      if (batch.status === "paused") {
+        saveJobState(stateDir, {
+          ...job,
+          status: "paused",
+          currentStage: "paused",
+          pausedReason: VERIFIER_REVIEW_REQUIRED,
+          pausedAt: new Date().toISOString(),
+          error: "Provider check outcome and billing are unknown; operator review required",
+        });
+      }
+    } catch {
+      // Do not change durable job state when the verifier is temporarily unreachable.
+    }
+  }
   res.json({ jobs: loadJobStates(stateDir) });
 });
 
