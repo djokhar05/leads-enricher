@@ -1,9 +1,11 @@
 import { isIP } from "node:net";
+import { extractJsonLdPeople } from "./person-extraction";
 
 export interface WebsiteResearchResult {
   url: string;
   title: string;
   text: string;
+  people?: string[];
   source: "company-domain";
 }
 
@@ -39,18 +41,22 @@ export const researchCompanyDomain = async (
     let title = "";
     let text = "";
     let sourceUrl = url;
-    const paths = ["", "/about", "/team"];
+    const people = new Set<string>();
+    const paths = ["", "/about", "/team", "/leadership", "/our-team", "/people", "/staff", "/contact"];
+    const bareDomain = domain.replace(/^www\./, "").toLowerCase();
     for (const path of paths) {
       signal?.throwIfAborted();
       const pageUrl = `${url}${path}`;
       try {
         const response = await fetch(pageUrl, {
-          redirect: "manual",
+          redirect: "follow",
           signal: signal
             ? AbortSignal.any([signal, AbortSignal.timeout(8_000)])
             : AbortSignal.timeout(8_000),
           headers: { Accept: "text/html" },
         });
+        const finalHost = new URL(response.url).hostname.replace(/^www\./, "").toLowerCase();
+        if (finalHost !== bareDomain) continue;
         if (!response.ok) continue;
         const contentType = response.headers.get("content-type") || "";
         if (!contentType.includes("text/html")) continue;
@@ -61,6 +67,7 @@ export const researchCompanyDomain = async (
             ? stripHtml(titleMatch[1]).slice(0, 300)
             : "";
         }
+        for (const name of extractJsonLdPeople(html)) people.add(name);
         const pageText = stripHtml(html).slice(0, 3_000);
         if (pageText) {
           if (!text) sourceUrl = pageUrl;
@@ -76,6 +83,7 @@ export const researchCompanyDomain = async (
       url: sourceUrl,
       title,
       text,
+      people: [...people],
       source: "company-domain",
     };
   } catch {

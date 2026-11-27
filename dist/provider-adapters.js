@@ -36,12 +36,12 @@ const enrichWithLlm = async (input, signal) => {
     if (!config_1.config.llmEnabled) {
         return null;
     }
-    const prompt = "Extract only human first and last names explicitly associated with this business in the provided source text. " +
-        "Use team pages, about pages, leadership pages, contact pages, or source snippets. " +
-        "Do not infer an owner, founder, or CEO when no person name is stated. " +
-        "Do not return company names, job titles, departments, role addresses, or a name without a supporting source. " +
+    const prompt = "From the provided text, extract only real people who hold an owner, founder, executive, director, principal, or partner role at this business. " +
+        "Copy each name exactly as it is written in the text. " +
+        "Do not return company names, job titles, departments, role addresses, or anyone without a stated role. " +
+        "If no such person is stated, return an empty list. " +
         "Return JSON: " +
-        '{"names":[{"firstName":"","lastName":"","confidence":0,"source":"page or snippet that states the name"}]}';
+        '{"names":[{"firstName":"","lastName":"","confidence":0,"source":"short quote from the text"}]}';
     const parseNames = (content) => {
         let names = [];
         try {
@@ -145,13 +145,13 @@ const enrichWithLlm = async (input, signal) => {
     try {
         if (config_1.config.llmProvider === "gemini") {
             const primary = await callGemini();
-            if (primary)
+            if (primary?.names.length)
                 return primary;
             return await callOpenAI(config_1.config.llmFallbackApiKey, config_1.config.llmFallbackBaseUrl, config_1.config.llmFallbackModel);
         }
         const primary = await callOpenAI(config_1.config.llmApiKey, config_1.config.llmBaseUrl ||
             "https://api.openai.com/v1", config_1.config.llmModel);
-        if (primary)
+        if (primary?.names.length)
             return primary;
         return await callOpenAI(config_1.config.llmFallbackApiKey, config_1.config.llmFallbackBaseUrl, config_1.config.llmFallbackModel);
     }

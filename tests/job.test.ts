@@ -108,7 +108,7 @@ test("new output omits verification metadata while preserving source values", as
   const rows: string[][] = parse(fs.readFileSync(outputPath), { relax_column_count: false });
   assert.deepEqual(rows[0], [
     "email", "verification_from_cache", "lead_row_id", "candidate_email",
-    "verification_status", "verification_reason",
+    "verification_status", "verification_reason", "verified_first_name", "verified_last_name",
   ]);
   assert.equal(rows[1][1], "source value");
   assert.equal(rows[1][3], "person@example.com");
@@ -199,8 +199,8 @@ test("recovery reuses saved candidates and truncates uncommitted output", async 
   const outputPath = path.join(directory, "output.csv");
   const stateDir = path.join(directory, "jobs");
   fs.writeFileSync(inputPath, "email\nfirst@example.com\nsecond@example.com\n");
-  const committed = "email,lead_row_id,candidate_email,verification_status,verification_reason\n" +
-    "first@example.com,row-1,first@example.com,valid,accepted\n";
+  const committed = "email,lead_row_id,candidate_email,verification_status,verification_reason,verified_first_name,verified_last_name\n" +
+    "first@example.com,row-1,first@example.com,valid,accepted,,\n";
   fs.writeFileSync(outputPath, `${committed}second@example.com,partial`);
   const row = { email: "second@example.com" };
   const candidates = rankedCandidateEmails(row, "email");
@@ -340,6 +340,17 @@ test("company names are not used as person names for candidate generation", asyn
         candidates: [{ content: { parts: [{ text: JSON.stringify({ names }) }] } }],
       }));
     }
+    if (String(input).startsWith("https://other.test")) {
+      const page = new Response(
+        "<html><body><h1>Our Team</h1><p>Meet Alex Jones, our leadership lead.</p></body></html>",
+        { headers: { "content-type": "text/html" } },
+      );
+      Object.defineProperty(page, "url", { value: String(input) });
+      return page;
+    }
+    if (String(input).startsWith("https://")) {
+      return new Response("", { status: 404 });
+    }
     return verifier(input, init);
   });
   const state = await runLeadJob({
@@ -359,7 +370,7 @@ test("company names are not used as person names for candidate generation", asyn
     fullNameColumn: "person",
     emailColumn: "email",
     llmEnabled: true,
-    websiteResearchEnabled: false,
+    websiteResearchEnabled: true,
     excludeMissingEmail: false,
   });
   assert.equal(state.status, "completed");
@@ -370,6 +381,10 @@ test("company names are not used as person names for candidate generation", asyn
   }
   assert.equal(rows[2].candidate_email, "jane.smith@person.test");
   assert.equal(rows[3].candidate_email, "alex.jones@other.test");
+  assert.equal(rows[3].verified_first_name, "Alex");
+  assert.equal(rows[3].verified_last_name, "Jones");
+  assert.equal(rows[2].verified_first_name, "");
+  assert.equal(rows[2].verified_last_name, "");
   assert.equal(rows[5].candidate_email, "contact@existing.test");
   assert.ok(verifiedEmails.includes("contact@existing.test"));
   assert.ok(verifiedEmails.includes("jane.smith@person.test"));
@@ -382,7 +397,7 @@ test("company names are not used as person names for candidate generation", asyn
   ));
 });
 
-test("resuming a legacy output keeps its existing columns aligned", async (t) => {
+test("output from before the verified name columns restarts from the first row", async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "lead-job-test-"));
   const previousAuditDir = config.auditDir;
   config.auditDir = path.join(directory, "audit");
@@ -398,13 +413,13 @@ test("resuming a legacy output keeps its existing columns aligned", async (t) =>
     "First,old,,not_deep_verified,No candidate email could be generated,,false,source-row\n",
   );
   const initialState: LeadJobState = {
-    id: "resume",
+    id: "restart",
     status: "paused",
     inputPath,
     outputPath,
     provider: "builtin",
     checkpointRow: 1,
-    totalRows: 1,
+    totalRows: 2,
     processedRows: 1,
     providerChecksCount: 0,
     billableChecksCount: 0,
@@ -412,7 +427,7 @@ test("resuming a legacy output keeps its existing columns aligned", async (t) =>
     updatedAt: new Date().toISOString(),
   };
   const state = await runLeadJob({
-    id: "resume",
+    id: "restart",
     inputPath,
     outputPath,
     stateDir: path.join(directory, "jobs"),
@@ -426,9 +441,10 @@ test("resuming a legacy output keeps its existing columns aligned", async (t) =>
   assert.equal(state.status, "completed");
   const rows: string[][] = parse(fs.readFileSync(outputPath), { relax_column_count: false });
   assert.equal(rows.length, 3);
-  assert.equal(rows[2][0], "Second");
-  assert.deepEqual(rows[2].slice(-3), ["", "false", "source-row"]);
+  assert.equal(rows[0].at(-1), "verified_last_name");
+  assert.deepEqual(rows.slice(1).map((row) => row[0]), ["First", "Second"]);
 });
+
 
 test("the output filter excludes missing candidates by default and can retain them", async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), "lead-job-test-"));

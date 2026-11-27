@@ -17,6 +17,7 @@ const audit_1 = require("./audit");
 const config_1 = require("./config");
 const pending_batch_1 = require("./pending-batch");
 const provider_adapters_1 = require("./provider-adapters");
+const person_extraction_1 = require("./person-extraction");
 const website_research_1 = require("./website-research");
 class JobCancelledError extends Error {
     constructor() {
@@ -30,13 +31,21 @@ const outputColumns = [
     "candidate_email",
     "verification_status",
     "verification_reason",
+    "verified_first_name",
+    "verified_last_name",
 ];
-const legacyOutputColumns = [
-    ...outputColumns,
-    "verification_domain",
-    "verification_from_cache",
-    "verification_provenance",
-];
+// Resumes only accept output written with the current columns. Older output is
+// restarted so every row in a finished file has the same layout.
+const outputHeaderMatches = async (outputPath) => {
+    if (!node_fs_1.default.existsSync(outputPath))
+        return false;
+    let matches = false;
+    const header = node_fs_1.default.createReadStream(outputPath).pipe((0, csv_parse_1.parse)({ bom: true, to: 1 }));
+    for await (const record of header) {
+        matches = outputColumns.every((column, index) => record[record.length - outputColumns.length + index] === column);
+    }
+    return matches;
+};
 const matchesCompanyName = (name, company) => {
     const normalize = (value) => value.normalize("NFKC").toLowerCase().replace(/[^\p{L}\p{N}]/gu, "");
     const normalizedName = normalize(name.replace(/\s*\(Owner\)$/i, ""));
@@ -70,12 +79,13 @@ const applyCachedDomainNames = (lead, domain, discoveredNames, options) => {
         : options?.fullNameColumn
             ? String(lead.source[options.fullNameColumn] || "").trim()
             : "";
+    const sourceOwnerName = ownerName && isUsablePersonName(ownerName, companyName)
+        ? ownerName.replace(/\s*\(Owner\)$/i, "").trim()
+        : "";
     const names = [
         ...new Set([
             ...discoveredNames.map((name) => name.replace(/\s*\(Owner\)$/i, "").trim()),
-            ownerName && isUsablePersonName(ownerName, companyName)
-                ? ownerName.replace(/\s*\(Owner\)$/i, "").trim()
-                : "",
+            sourceOwnerName,
         ].filter(Boolean)),
     ];
     if (names.length === 0) {
@@ -101,6 +111,13 @@ const applyCachedDomainNames = (lead, domain, discoveredNames, options) => {
         if (ranked.length > 0) {
             lead.rankedCandidates = ranked;
             lead.candidateEmail = ranked[0].email;
+            // A name already in the source's owner column is not new information.
+            if (fullName !== sourceOwnerName) {
+                lead.discoveredName = {
+                    firstName: parts[0],
+                    lastName: parts.slice(1).join(" "),
+                };
+            }
             lead.verificationStatus = "not_processed";
             lead.verificationReason = undefined;
             lead.provenance = [...lead.provenance, "ai-discovery"];
@@ -192,6 +209,17 @@ const runLeadJob = async (options) => {
     }
     let pending = (0, pending_batch_1.loadPendingBatch)(options.stateDir, options.id);
     let pendingBatchProcessed = false;
+    if (state.checkpointRow > 0 &&
+        node_fs_1.default.existsSync(options.outputPath) &&
+        !(await outputHeaderMatches(options.outputPath))) {
+        // Output from before the verified name columns cannot be appended to safely.
+        // Restart from the first row; verifier results already paid for stay on the verifier.
+        if (pending)
+            (0, pending_batch_1.completePendingBatch)(options.stateDir, pending);
+        pending = undefined;
+        state.checkpointRow = 0;
+        state.processedRows = 0;
+    }
     if (pending && state.checkpointRow >= pending.endRow) {
         (0, pending_batch_1.completePendingBatch)(options.stateDir, pending);
         pending = undefined;
@@ -224,7 +252,6 @@ const runLeadJob = async (options) => {
     let rowNumber = 0;
     // Once a header is written, subsequent resumed batches must not write it again.
     let headerWritten = node_fs_1.default.statSync(options.outputPath).size > 0;
-    let legacyOutput = false;
     // Append mode keeps memory bounded and allows checkpoints to survive restarts.
     const output = node_fs_1.default.createWriteStream(options.outputPath, {
         flags: "a",
@@ -310,13 +337,23 @@ const runLeadJob = async (options) => {
                     ? await (0, website_research_1.researchCompanyDomain)(domain, options.signal)
                     : null;
                 throwIfCancelled();
-                const discovered = await (0, provider_adapters_1.enrichWithLlm)({
-                    domain,
-                    companyName: companyName || research?.title,
-                    sourceUrl: research?.url,
-                    sourceText: research?.text,
-                }, options.signal);
-                const discoveredNames = (discovered?.names || []).filter((name) => isUsablePersonName(name, companyName));
+                const deterministicNames = research
+                    ? (0, person_extraction_1.extractDeterministicNames)(research)
+                    : [];
+                const usableDeterministic = deterministicNames.filter((name) => isUsablePersonName(name, companyName));
+                let discovered = null;
+                const leadershipText = research ? (0, person_extraction_1.leadershipSnippet)(research.text) : "";
+                if (usableDeterministic.length === 0 && leadershipText) {
+                    discovered = await (0, provider_adapters_1.enrichWithLlm)({
+                        domain,
+                        companyName: companyName || research?.title,
+                        sourceUrl: research?.url,
+                        sourceText: leadershipText,
+                    }, options.signal);
+                }
+                const sourceText = research?.text ?? "";
+                const llmNames = (discovered?.names || []).filter((name) => (0, person_extraction_1.appearsInSource)(name, sourceText));
+                const discoveredNames = [...new Set([...usableDeterministic, ...llmNames])].filter((name) => isUsablePersonName(name, companyName));
                 (0, domain_cache_1.setDomainCache)(domain, { names: discoveredNames, verifiedAt: Date.now() }, 24 * 60 * 60 * 1000);
                 if (discovered) {
                     state.tokenCount = (state.tokenCount || 0) + discovered.tokenCount;
@@ -326,6 +363,8 @@ const runLeadJob = async (options) => {
                     jobId: options.id,
                     domain,
                     companyName,
+                    deterministicNames: usableDeterministic,
+                    llmCalled: Boolean(discovered),
                     discoveredNames,
                 });
                 for (const lead of leads)
@@ -438,6 +477,10 @@ const runLeadJob = async (options) => {
                         `${selected.result.reason || "Verified candidate"}; score=${selected.candidate.score}; rank=${selected.candidate.provenance}`;
                     lead.verificationDomain = selected.result.domain;
                     lead.verificationFromCache = selected.result.fromCache;
+                    // Only AI-discovered names are new information; source-derived names are already in the CSV.
+                    lead.verifiedName = selected.candidate.provenance.startsWith("ai+")
+                        ? lead.discoveredName
+                        : undefined;
                     const domain = selected.result.domain ||
                         selected.candidate.email.split("@").at(-1);
                     if (domain)
@@ -461,25 +504,14 @@ const runLeadJob = async (options) => {
                 lead.candidateEmail || "",
                 lead.verificationStatus,
                 lead.verificationReason || "",
-                ...(legacyOutput
-                    ? [
-                        lead.verificationDomain || "",
-                        String(lead.verificationFromCache ?? false),
-                        lead.provenance.join("|"),
-                    ]
-                    : []),
+                lead.verifiedName?.firstName || "",
+                lead.verifiedName?.lastName || "",
             ];
             await writeOutput(`${line.map(csv_1.csvEscape).join(",")}\n`);
         }
         pendingBatchProcessed = true;
     };
     try {
-        if (headerWritten && state.checkpointRow > 0) {
-            const outputHeader = node_fs_1.default.createReadStream(options.outputPath).pipe((0, csv_parse_1.parse)({ bom: true, to: 1 }));
-            for await (const record of outputHeader) {
-                legacyOutput = legacyOutputColumns.every((column, index) => record[record.length - legacyOutputColumns.length + index] === column);
-            }
-        }
         // Batch state is held locally instead of the entire file. This limits peak memory
         // while still preserving original row order in the output.
         let batch = [];

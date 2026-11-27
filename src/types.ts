@@ -80,5 +80,10 @@ export interface LeadRow {
   verificationReason?: string;
   verificationDomain?: string;
   verificationFromCache?: boolean;
+  // Name found by AI discovery; used for candidate generation.
+  discoveredName?: { firstName: string; lastName: string };
+  // Set only when the verified email came from a discovered name, so names
+  // already present in the source CSV are not duplicated in the output.
+  verifiedName?: { firstName: string; lastName: string };
   provenance: string[];
 }

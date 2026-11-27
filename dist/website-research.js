@@ -2,6 +2,7 @@
 Object.defineProperty(exports, "__esModule", { value: true });
 exports.researchCompanySearch = exports.researchCompanyDomain = void 0;
 const node_net_1 = require("node:net");
+const person_extraction_1 = require("./person-extraction");
 const stripHtml = (html) => html
     .replace(/<script[\s\S]*?<\/script>/gi, " ")
     .replace(/<style[\s\S]*?<\/style>/gi, " ")
@@ -32,18 +33,23 @@ const researchCompanyDomain = async (domain, signal) => {
         let title = "";
         let text = "";
         let sourceUrl = url;
-        const paths = ["", "/about", "/team"];
+        const people = new Set();
+        const paths = ["", "/about", "/team", "/leadership", "/our-team", "/people", "/staff", "/contact"];
+        const bareDomain = domain.replace(/^www\./, "").toLowerCase();
         for (const path of paths) {
             signal?.throwIfAborted();
             const pageUrl = `${url}${path}`;
             try {
                 const response = await fetch(pageUrl, {
-                    redirect: "manual",
+                    redirect: "follow",
                     signal: signal
                         ? AbortSignal.any([signal, AbortSignal.timeout(8_000)])
                         : AbortSignal.timeout(8_000),
                     headers: { Accept: "text/html" },
                 });
+                const finalHost = new URL(response.url).hostname.replace(/^www\./, "").toLowerCase();
+                if (finalHost !== bareDomain)
+                    continue;
                 if (!response.ok)
                     continue;
                 const contentType = response.headers.get("content-type") || "";
@@ -56,6 +62,8 @@ const researchCompanyDomain = async (domain, signal) => {
                         ? stripHtml(titleMatch[1]).slice(0, 300)
                         : "";
                 }
+                for (const name of (0, person_extraction_1.extractJsonLdPeople)(html))
+                    people.add(name);
                 const pageText = stripHtml(html).slice(0, 3_000);
                 if (pageText) {
                     if (!text)
@@ -74,6 +82,7 @@ const researchCompanyDomain = async (domain, signal) => {
             url: sourceUrl,
             title,
             text,
+            people: [...people],
             source: "company-domain",
         };
     }
