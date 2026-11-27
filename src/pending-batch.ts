@@ -18,6 +18,11 @@ export interface PendingBatch {
   billingUnknownCount?: number;
   cacheHitCount?: number;
   verifierCompleted?: boolean;
+  readyVerifierCompleted?: boolean;
+  readyVerifierResponseCompleted?: boolean;
+  researchCompleted?: boolean;
+  researchVerifierCompleted?: boolean;
+  researchRequestId?: string;
 }
 
 const location = (directory: string, jobId: string): string => {

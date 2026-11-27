@@ -52,7 +52,7 @@ const matchesCompanyName = (name, company) => {
     return Boolean(normalizedName && normalizedName === normalize(company));
 };
 const roleWords = new Set([
-    "owner", "founder", "ceo", "team", "sales", "support", "admin",
+    "owner", "founder", "ceo", "team", "staff", "leadership", "management", "sales", "support", "admin",
     "info", "contact", "marketing", "office", "service", "services",
 ]);
 const isUsablePersonName = (name, companyName) => {
@@ -67,6 +67,63 @@ const isUsablePersonName = (name, companyName) => {
     if (!/^[a-zA-Z][a-zA-Z.' -]+ [a-zA-Z][a-zA-Z.' -]+$/.test(cleaned))
         return false;
     return true;
+};
+const mapWithConcurrency = async (items, concurrency, worker) => {
+    if (items.length === 0)
+        return [];
+    const results = new Array(items.length);
+    let nextIndex = 0;
+    const workers = Array.from({ length: Math.min(Math.max(concurrency, 1), items.length) }, async () => {
+        for (;;) {
+            const index = nextIndex++;
+            if (index >= items.length)
+                return;
+            results[index] = await worker(items[index]);
+        }
+    });
+    await Promise.all(workers);
+    return results;
+};
+const applyVerifierResponse = (batch, response) => {
+    const byEmail = new Map(response.results.map((result) => [result.email, result]));
+    for (const lead of batch) {
+        const ranked = lead.rankedCandidates || [];
+        if (ranked.some((candidate) => (0, suppressions_1.isSuppressed)(candidate.email))) {
+            lead.verificationStatus = "not_deep_verified";
+            lead.verificationReason = "Candidate is suppressed";
+        }
+        const verified = ranked
+            .map((candidate) => ({
+            candidate,
+            result: byEmail.get(candidate.email),
+        }))
+            .filter((entry) => entry.result &&
+            entry.result.status !== "provider_failed" &&
+            entry.result.status !== "rate_limited" &&
+            !(0, suppressions_1.isSuppressed)(entry.candidate.email))
+            .sort((a, b) => b.candidate.score - a.candidate.score);
+        const selected = verified[0];
+        if (selected?.result) {
+            lead.candidateEmail = selected.candidate.email;
+            lead.verificationStatus = selected.result.status;
+            lead.verificationReason =
+                `${selected.result.reason || "Verified candidate"}; score=${selected.candidate.score}; rank=${selected.candidate.provenance}`;
+            lead.verificationDomain = selected.result.domain;
+            lead.verificationFromCache = selected.result.fromCache;
+            lead.verifiedName = selected.candidate.provenance.startsWith("ai+")
+                ? lead.discoveredName
+                : undefined;
+            const domain = selected.result.domain ||
+                selected.candidate.email.split("@").at(-1);
+            if (domain)
+                (0, domain_cache_1.setDomainCache)(domain, selected.result);
+        }
+        else if (!lead.verificationReason) {
+            lead.verificationStatus = "not_deep_verified";
+            lead.verificationReason =
+                "No ranked candidate produced a usable verification result";
+        }
+    }
 };
 const applyCachedDomainNames = (lead, domain, discoveredNames, options) => {
     if ((lead.rankedCandidates || []).length > 0)
@@ -300,77 +357,6 @@ const runLeadJob = async (options) => {
             }
             batch.splice(0, batch.length, ...pending.rows);
         }
-        else if (options.llmEnabled) {
-            state.currentStage = "candidates";
-            state.stageUpdatedAt = new Date().toISOString();
-            state = (0, state_1.saveJobState)(options.stateDir, state);
-            const domainLeads = new Map();
-            for (const lead of batch) {
-                if ((lead.rankedCandidates || []).length > 0)
-                    continue;
-                const domain = (0, csv_1.normalizeDomain)((options.domainColumn ? String(lead.source[options.domainColumn] || "") : "") ||
-                    (options.websiteColumn ? String(lead.source[options.websiteColumn] || "") : ""));
-                if (!domain)
-                    continue;
-                const leads = domainLeads.get(domain) || [];
-                leads.push(lead);
-                domainLeads.set(domain, leads);
-            }
-            for (const [domain, leads] of domainLeads) {
-                throwIfCancelled();
-                state.currentStage = "research";
-                state.stageUpdatedAt = new Date().toISOString();
-                state = (0, state_1.saveJobState)(options.stateDir, state);
-                const cached = (0, domain_cache_1.getDomainCache)(domain);
-                if (cached && typeof cached === "object") {
-                    const cachedNames = "names" in cached && Array.isArray(cached.names)
-                        ? cached.names.filter((name) => typeof name === "string")
-                        : [];
-                    for (const lead of leads)
-                        applyCachedDomainNames(lead, domain, cachedNames, options);
-                    continue;
-                }
-                const companyName = options.companyNameColumn
-                    ? (0, csv_1.valueFromRow)(leads[0].source, options.companyNameColumn)
-                    : "";
-                const research = (options.websiteResearchEnabled ?? true)
-                    ? await (0, website_research_1.researchCompanyDomain)(domain, options.signal)
-                    : null;
-                throwIfCancelled();
-                const deterministicNames = research
-                    ? (0, person_extraction_1.extractDeterministicNames)(research)
-                    : [];
-                const usableDeterministic = deterministicNames.filter((name) => isUsablePersonName(name, companyName));
-                let discovered = null;
-                const leadershipText = research ? (0, person_extraction_1.leadershipSnippet)(research.text) : "";
-                if (usableDeterministic.length === 0 && leadershipText) {
-                    discovered = await (0, provider_adapters_1.enrichWithLlm)({
-                        domain,
-                        companyName: companyName || research?.title,
-                        sourceUrl: research?.url,
-                        sourceText: leadershipText,
-                    }, options.signal);
-                }
-                const sourceText = research?.text ?? "";
-                const llmNames = (discovered?.names || []).filter((name) => (0, person_extraction_1.appearsInSource)(name, sourceText));
-                const discoveredNames = [...new Set([...usableDeterministic, ...llmNames])].filter((name) => isUsablePersonName(name, companyName));
-                (0, domain_cache_1.setDomainCache)(domain, { names: discoveredNames, verifiedAt: Date.now() }, 24 * 60 * 60 * 1000);
-                if (discovered) {
-                    state.tokenCount = (state.tokenCount || 0) + discovered.tokenCount;
-                    state.costEstimateUsd = (state.costEstimateUsd || 0) + discovered.costEstimateUsd;
-                }
-                console.info("[lead-enrichment] AI discovery result", {
-                    jobId: options.id,
-                    domain,
-                    companyName,
-                    deterministicNames: usableDeterministic,
-                    llmCalled: Boolean(discovered),
-                    discoveredNames,
-                });
-                for (const lead of leads)
-                    applyCachedDomainNames(lead, domain, discoveredNames, options);
-            }
-        }
         throwIfCancelled();
         if (!pending) {
             await flushOutput();
@@ -391,16 +377,157 @@ const runLeadJob = async (options) => {
             };
             (0, pending_batch_1.savePendingBatch)(options.stateDir, pending);
         }
+        // Verify rows that already have source/deterministic candidates before any
+        // website research. This keeps useful provider work moving immediately.
+        if (!pending.readyVerifierCompleted) {
+            const readyCandidates = [
+                ...new Set(batch.flatMap((lead) => lead.verificationStatus === "not_processed"
+                    ? (lead.rankedCandidates || [])
+                        .map((candidate) => candidate.email)
+                        .filter((email) => !(0, suppressions_1.isSuppressed)(email))
+                    : [])),
+            ];
+            if (readyCandidates.length === 0) {
+                pending.readyVerifierCompleted = true;
+                pending.rows = batch;
+                (0, pending_batch_1.savePendingBatch)(options.stateDir, pending);
+            }
+            else {
+                state.currentStage = "verification";
+                state.stageUpdatedAt = new Date().toISOString();
+                state = (0, state_1.saveJobState)(options.stateDir, state);
+                const providerChecksBase = state.providerChecksCount;
+                const billableChecksBase = state.billableChecksCount;
+                const billingUnknownBase = state.billingUnknownCount || 0;
+                const cacheHitBase = state.cacheHitCount || 0;
+                const response = await (0, verifier_client_1.verifyBatch)(options.verifierBaseUrl, options.verifierAuthToken, pending.requestId, options.provider, readyCandidates, Math.max(options.providerCallLimit - state.providerChecksCount, 0), options.signal, options.skipUncertainChecks, (batchStatus) => {
+                    state.providerChecksCount = providerChecksBase + batchStatus.providerChecksCount;
+                    state.billableChecksCount = billableChecksBase + batchStatus.billableChecksCount;
+                    state.billingUnknownCount = billingUnknownBase + (batchStatus.billingUnknownCount || 0);
+                    state.cacheHitCount = cacheHitBase + batchStatus.cacheHitCount;
+                    state.currentStage = batchStatus.status === "paused" ? "paused" : "verification";
+                    state.stageUpdatedAt = new Date().toISOString();
+                    state = (0, state_1.saveJobState)(options.stateDir, state);
+                });
+                throwIfCancelled();
+                state.providerChecksCount = providerChecksBase + response.providerChecksCount;
+                state.billableChecksCount = billableChecksBase + response.billableChecksCount;
+                state.billingUnknownCount = billingUnknownBase + (response.billingUnknownCount || 0);
+                state.cacheHitCount = cacheHitBase + response.cacheHitCount;
+                applyVerifierResponse(batch, response);
+                pending.readyVerifierCompleted = true;
+                pending.readyVerifierResponseCompleted = response.status === "completed";
+                pending.verifierCompleted = false;
+                pending.rows = batch;
+                (0, pending_batch_1.savePendingBatch)(options.stateDir, pending);
+            }
+        }
+        if (options.llmEnabled && !pending.researchCompleted) {
+            state.currentStage = "candidates";
+            state.stageUpdatedAt = new Date().toISOString();
+            state = (0, state_1.saveJobState)(options.stateDir, state);
+            const domainLeads = new Map();
+            for (const lead of batch) {
+                if ((lead.rankedCandidates || []).length > 0)
+                    continue;
+                const domain = (0, csv_1.normalizeDomain)((options.domainColumn ? String(lead.source[options.domainColumn] || "") : "") ||
+                    (options.websiteColumn ? String(lead.source[options.websiteColumn] || "") : ""));
+                if (!domain)
+                    continue;
+                const leads = domainLeads.get(domain) || [];
+                leads.push(lead);
+                domainLeads.set(domain, leads);
+            }
+            state.researchedDomains = 0;
+            state.totalResearchDomains = domainLeads.size;
+            state.currentResearchDomain = undefined;
+            state = (0, state_1.saveJobState)(options.stateDir, state);
+            let researchedDomains = 0;
+            await mapWithConcurrency([...domainLeads.entries()], 8, async ([domain, leads]) => {
+                throwIfCancelled();
+                state.currentStage = "research";
+                state.currentResearchDomain = domain;
+                state.researchedDomains = researchedDomains;
+                state.totalResearchDomains = domainLeads.size;
+                state.stageUpdatedAt = new Date().toISOString();
+                state = (0, state_1.saveJobState)(options.stateDir, state);
+                const cached = (0, domain_cache_1.getDomainCache)(domain);
+                let discoveredNames = [];
+                let tokenCount = 0;
+                let costEstimateUsd = 0;
+                if (cached && typeof cached === "object") {
+                    discoveredNames = "names" in cached && Array.isArray(cached.names)
+                        ? cached.names.filter((name) => typeof name === "string")
+                        : [];
+                }
+                else {
+                    const companyName = options.companyNameColumn
+                        ? (0, csv_1.valueFromRow)(leads[0].source, options.companyNameColumn)
+                        : "";
+                    const research = (options.websiteResearchEnabled ?? true)
+                        ? await (0, website_research_1.researchCompanyDomain)(domain, options.signal)
+                        : null;
+                    throwIfCancelled();
+                    const deterministicNames = research
+                        ? (0, person_extraction_1.extractDeterministicNames)(research)
+                        : [];
+                    const usableDeterministic = deterministicNames.filter((name) => isUsablePersonName(name, companyName));
+                    let discovered = null;
+                    const leadershipText = research ? (0, person_extraction_1.leadershipSnippet)(research.text) : "";
+                    if (usableDeterministic.length === 0 && leadershipText) {
+                        discovered = await (0, provider_adapters_1.enrichWithLlm)({
+                            domain,
+                            companyName: companyName || research?.title,
+                            sourceUrl: research?.url,
+                            sourceText: leadershipText,
+                        }, options.signal);
+                    }
+                    const sourceText = research?.text ?? "";
+                    const llmNames = (discovered?.names || []).filter((name) => (0, person_extraction_1.appearsInSource)(name, sourceText));
+                    discoveredNames = [...new Set([...usableDeterministic, ...llmNames])].filter((name) => isUsablePersonName(name, companyName));
+                    (0, domain_cache_1.setDomainCache)(domain, { names: discoveredNames, verifiedAt: Date.now() }, 24 * 60 * 60 * 1000);
+                    if (discovered) {
+                        tokenCount = discovered.tokenCount;
+                        costEstimateUsd = discovered.costEstimateUsd;
+                    }
+                    console.info("[lead-enrichment] AI discovery result", {
+                        jobId: options.id,
+                        domain,
+                        companyName,
+                        deterministicNames: usableDeterministic,
+                        llmCalled: Boolean(discovered),
+                        discoveredNames,
+                    });
+                }
+                for (const lead of leads)
+                    applyCachedDomainNames(lead, domain, discoveredNames, options);
+                researchedDomains += 1;
+                state.tokenCount = (state.tokenCount || 0) + tokenCount;
+                state.costEstimateUsd = (state.costEstimateUsd || 0) + costEstimateUsd;
+                state.researchedDomains = researchedDomains;
+                state.stageUpdatedAt = new Date().toISOString();
+                state = (0, state_1.saveJobState)(options.stateDir, state);
+            });
+            state.currentResearchDomain = undefined;
+            pending.researchCompleted = true;
+            pending.rows = batch;
+            (0, pending_batch_1.savePendingBatch)(options.stateDir, pending);
+            state = (0, state_1.saveJobState)(options.stateDir, state);
+        }
         // A row with no candidate is retained but explicitly marked not verified.
         // The addresses below, rather than the source rows, determine provider calls.
         // Only candidate addresses consume the verifier/provider budget.
         const candidates = [
-            ...new Set(batch.flatMap((lead) => (lead.rankedCandidates || [])
-                .map((candidate) => candidate.email)
-                .filter((email) => !(0, suppressions_1.isSuppressed)(email)))),
+            ...new Set(batch.flatMap((lead) => lead.verificationStatus === "not_processed"
+                ? ((lead.rankedCandidates || [])
+                    .map((candidate) => candidate.email)
+                    .filter((email) => !(0, suppressions_1.isSuppressed)(email)))
+                : [])),
         ];
         if (candidates.length === 0) {
             for (const lead of batch) {
+                if (lead.verificationStatus)
+                    continue;
                 lead.verificationStatus = "not_deep_verified";
                 lead.verificationReason =
                     lead.verificationReason === "no_name_found"
@@ -412,11 +539,18 @@ const runLeadJob = async (options) => {
                             : "no_domain_found";
                 lead.verificationDomain = undefined;
             }
+            if (pending.readyVerifierResponseCompleted) {
+                pending.verifierCompleted = true;
+            }
         }
-        else {
+        else if (!pending.researchVerifierCompleted) {
             // Remaining job budget is calculated here so each batch cannot overspend
             // the operator's configured enrichment provider-call limit.
             // The batch response is authoritative for both provider counts and outcomes.
+            if (!pending.researchRequestId) {
+                pending.researchRequestId = `${pending.requestId}-research`;
+                (0, pending_batch_1.savePendingBatch)(options.stateDir, pending);
+            }
             state.currentStage = "verification";
             state.stageUpdatedAt = new Date().toISOString();
             state.currentBatch =
@@ -428,7 +562,7 @@ const runLeadJob = async (options) => {
             const billableChecksBase = state.billableChecksCount;
             const billingUnknownBase = state.billingUnknownCount || 0;
             const cacheHitBase = state.cacheHitCount || 0;
-            const response = await (0, verifier_client_1.verifyBatch)(options.verifierBaseUrl, options.verifierAuthToken, pending.requestId, options.provider, candidates, Math.max(options.providerCallLimit - state.providerChecksCount, 0), options.signal, options.skipUncertainChecks, (batchStatus) => {
+            const response = await (0, verifier_client_1.verifyBatch)(options.verifierBaseUrl, options.verifierAuthToken, pending.researchRequestId, options.provider, candidates, Math.max(options.providerCallLimit - state.providerChecksCount, 0), options.signal, options.skipUncertainChecks, (batchStatus) => {
                 state.providerChecksCount = providerChecksBase + batchStatus.providerChecksCount;
                 state.billableChecksCount = billableChecksBase + batchStatus.billableChecksCount;
                 state.billingUnknownCount = billingUnknownBase + (batchStatus.billingUnknownCount || 0);
@@ -439,7 +573,8 @@ const runLeadJob = async (options) => {
                 state = (0, state_1.saveJobState)(options.stateDir, state);
             });
             if (response.status === "completed") {
-                pending.verifierCompleted = true;
+                pending.researchVerifierCompleted = true;
+                pending.verifierCompleted = Boolean(pending.readyVerifierCompleted);
                 (0, pending_batch_1.savePendingBatch)(options.stateDir, pending);
             }
             state.providerChecksCount = providerChecksBase + response.providerChecksCount;
@@ -492,6 +627,8 @@ const runLeadJob = async (options) => {
                         "No ranked candidate produced a usable verification result";
                 }
             }
+            pending.rows = batch;
+            (0, pending_batch_1.savePendingBatch)(options.stateDir, pending);
         }
         for (const lead of batch) {
             if (excludeMissingEmail && !lead.candidateEmail)

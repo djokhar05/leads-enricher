@@ -35,3 +35,10 @@ test("model names must appear verbatim in the source text", () => {
   assert.equal(appearsInSource("Jane Smith", "Founder: jane   smith"), true);
   assert.equal(appearsInSource("Alex Jones", "Founder: Jane Smith"), false);
 });
+
+test("team and staff labels are not extracted as person names", () => {
+  const names = extractDeterministicNames({
+    text: "Founder: Lassonde Staff. Our Team: Jane Smith",
+  });
+  assert.ok(!names.some((name) => /staff|team/i.test(name)));
+});

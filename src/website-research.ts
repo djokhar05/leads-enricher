@@ -1,5 +1,5 @@
 import { isIP } from "node:net";
-import { extractJsonLdPeople } from "./person-extraction";
+import { extractJsonLdPeople, extractTitledNames } from "./person-extraction";
 
 export interface WebsiteResearchResult {
   url: string;
@@ -42,7 +42,7 @@ export const researchCompanyDomain = async (
     let text = "";
     let sourceUrl = url;
     const people = new Set<string>();
-    const paths = ["", "/about", "/team", "/leadership", "/our-team", "/people", "/staff", "/contact"];
+    const paths = ["", "/about", "/team", "/leadership"];
     const bareDomain = domain.replace(/^www\./, "").toLowerCase();
     for (const path of paths) {
       signal?.throwIfAborted();
@@ -52,7 +52,7 @@ export const researchCompanyDomain = async (
           redirect: "follow",
           signal: signal
             ? AbortSignal.any([signal, AbortSignal.timeout(8_000)])
-            : AbortSignal.timeout(8_000),
+            : AbortSignal.timeout(5_000),
           headers: { Accept: "text/html" },
         });
         const finalHost = new URL(response.url).hostname.replace(/^www\./, "").toLowerCase();
@@ -72,6 +72,12 @@ export const researchCompanyDomain = async (
         if (pageText) {
           if (!text) sourceUrl = pageUrl;
           text = `${text}\n${pageText}`.slice(0, 6_000);
+        }
+        if (
+          people.size > 0 ||
+          extractTitledNames(pageText).length > 0
+        ) {
+          break;
         }
       } catch {
         signal?.throwIfAborted();

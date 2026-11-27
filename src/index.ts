@@ -811,18 +811,11 @@ app.post("/jobs/:jobId/retry", (req, res) => {
   res.status(202).json(retried);
 });
 
-app.post("/upload", upload.single("file"), async (req, res) => {
-  if (!req.file) {
-    res.status(400).json({ error: "CSV file is required" });
-    return;
-  }
-  console.info("[lead-enrichment] POST /upload received", {
-    fileName: req.file.filename,
-    sizeBytes: req.file.size,
-  });
-  let mappings: ReturnType<typeof detectCsvHeaderMappings> | null = null;
+const readCsvHeaderMappings = async (
+  filePath: string,
+): Promise<ReturnType<typeof detectCsvHeaderMappings> | null> => {
   try {
-    const stream = fs.createReadStream(req.file.path);
+    const stream = fs.createReadStream(filePath);
     const { parse } = await import("csv-parse");
     const parser = stream.pipe(
       parse({
@@ -835,15 +828,55 @@ app.post("/upload", upload.single("file"), async (req, res) => {
     );
     for await (const record of parser as AsyncIterable<unknown>) {
       if (Array.isArray(record)) {
-        mappings = detectCsvHeaderMappings(
+        return detectCsvHeaderMappings(
           record.map((value) => String(value || "")),
         );
       }
       break;
     }
+    return null;
   } catch {
-    mappings = null;
+    return null;
   }
+};
+
+app.post("/inspect", async (req, res) => {
+  const requestedPath = typeof req.body?.inputPath === "string" ? req.body.inputPath : "";
+  if (!requestedPath) {
+    res.status(400).json({ error: "inputPath is required" });
+    return;
+  }
+  let inputPath: string;
+  try {
+    inputPath = resolveAllowedInputPath(requestedPath);
+  } catch (error) {
+    res.status(400).json({
+      error: error instanceof Error ? error.message : "Invalid input path",
+    });
+    return;
+  }
+  if (!fs.existsSync(inputPath)) {
+    res.status(404).json({ error: "Input CSV not found" });
+    return;
+  }
+  const mappings = await readCsvHeaderMappings(inputPath);
+  if (!mappings) {
+    res.status(422).json({ error: "Could not read CSV headers from this file" });
+    return;
+  }
+  res.json({ inputPath, mappings });
+});
+
+app.post("/upload", upload.single("file"), async (req, res) => {
+  if (!req.file) {
+    res.status(400).json({ error: "CSV file is required" });
+    return;
+  }
+  console.info("[lead-enrichment] POST /upload received", {
+    fileName: req.file.filename,
+    sizeBytes: req.file.size,
+  });
+  const mappings = await readCsvHeaderMappings(req.file.path);
   appendAudit({
     timestamp: new Date().toISOString(),
     hostId: config.hostId,

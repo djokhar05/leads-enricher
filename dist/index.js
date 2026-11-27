@@ -753,18 +753,9 @@ exports.app.post("/jobs/:jobId/retry", (req, res) => {
     });
     res.status(202).json(retried);
 });
-exports.app.post("/upload", upload.single("file"), async (req, res) => {
-    if (!req.file) {
-        res.status(400).json({ error: "CSV file is required" });
-        return;
-    }
-    console.info("[lead-enrichment] POST /upload received", {
-        fileName: req.file.filename,
-        sizeBytes: req.file.size,
-    });
-    let mappings = null;
+const readCsvHeaderMappings = async (filePath) => {
     try {
-        const stream = node_fs_1.default.createReadStream(req.file.path);
+        const stream = node_fs_1.default.createReadStream(filePath);
         const { parse } = await Promise.resolve().then(() => __importStar(require("csv-parse")));
         const parser = stream.pipe(parse({
             bom: true,
@@ -775,14 +766,53 @@ exports.app.post("/upload", upload.single("file"), async (req, res) => {
         }));
         for await (const record of parser) {
             if (Array.isArray(record)) {
-                mappings = (0, csv_1.detectCsvHeaderMappings)(record.map((value) => String(value || "")));
+                return (0, csv_1.detectCsvHeaderMappings)(record.map((value) => String(value || "")));
             }
             break;
         }
+        return null;
     }
     catch {
-        mappings = null;
+        return null;
     }
+};
+exports.app.post("/inspect", async (req, res) => {
+    const requestedPath = typeof req.body?.inputPath === "string" ? req.body.inputPath : "";
+    if (!requestedPath) {
+        res.status(400).json({ error: "inputPath is required" });
+        return;
+    }
+    let inputPath;
+    try {
+        inputPath = (0, security_1.resolveAllowedInputPath)(requestedPath);
+    }
+    catch (error) {
+        res.status(400).json({
+            error: error instanceof Error ? error.message : "Invalid input path",
+        });
+        return;
+    }
+    if (!node_fs_1.default.existsSync(inputPath)) {
+        res.status(404).json({ error: "Input CSV not found" });
+        return;
+    }
+    const mappings = await readCsvHeaderMappings(inputPath);
+    if (!mappings) {
+        res.status(422).json({ error: "Could not read CSV headers from this file" });
+        return;
+    }
+    res.json({ inputPath, mappings });
+});
+exports.app.post("/upload", upload.single("file"), async (req, res) => {
+    if (!req.file) {
+        res.status(400).json({ error: "CSV file is required" });
+        return;
+    }
+    console.info("[lead-enrichment] POST /upload received", {
+        fileName: req.file.filename,
+        sizeBytes: req.file.size,
+    });
+    const mappings = await readCsvHeaderMappings(req.file.path);
     (0, audit_1.appendAudit)({
         timestamp: new Date().toISOString(),
         hostId: config_1.config.hostId,

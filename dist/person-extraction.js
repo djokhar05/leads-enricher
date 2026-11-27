@@ -11,7 +11,7 @@ const nonNameWords = new Set([
     "about", "and", "best", "business", "call", "click", "client", "company", "contact",
     "customer", "for", "from", "get", "hello", "home", "info", "learn", "leadership", "meet",
     "mission", "new", "of", "office", "our", "read", "sales", "service", "services", "story",
-    "support", "team", "the", "vision", "we", "welcome", "with", "you", "your",
+    "staff", "support", "team", "the", "vision", "we", "welcome", "with", "you", "your",
 ]);
 const looksLikePerson = (name) => name.split(/\s+/).every((word) => !nonNameWords.has(word.toLowerCase()));
 const LEADERSHIP_CUE = /\b(founder|co-?founder|owner|ceo|chief executive|president|principal|managing (?:director|partner)|director|partner|our team|meet the team|leadership|about us|who we are)\b/gi;

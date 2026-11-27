@@ -12,7 +12,7 @@ const nonNameWords = new Set([
   "about", "and", "best", "business", "call", "click", "client", "company", "contact",
   "customer", "for", "from", "get", "hello", "home", "info", "learn", "leadership", "meet",
   "mission", "new", "of", "office", "our", "read", "sales", "service", "services", "story",
-  "support", "team", "the", "vision", "we", "welcome", "with", "you", "your",
+  "staff", "support", "team", "the", "vision", "we", "welcome", "with", "you", "your",
 ]);
 
 const looksLikePerson = (name: string): boolean =>

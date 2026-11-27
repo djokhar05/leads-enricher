@@ -34,7 +34,7 @@ const researchCompanyDomain = async (domain, signal) => {
         let text = "";
         let sourceUrl = url;
         const people = new Set();
-        const paths = ["", "/about", "/team", "/leadership", "/our-team", "/people", "/staff", "/contact"];
+        const paths = ["", "/about", "/team", "/leadership"];
         const bareDomain = domain.replace(/^www\./, "").toLowerCase();
         for (const path of paths) {
             signal?.throwIfAborted();
@@ -44,7 +44,7 @@ const researchCompanyDomain = async (domain, signal) => {
                     redirect: "follow",
                     signal: signal
                         ? AbortSignal.any([signal, AbortSignal.timeout(8_000)])
-                        : AbortSignal.timeout(8_000),
+                        : AbortSignal.timeout(5_000),
                     headers: { Accept: "text/html" },
                 });
                 const finalHost = new URL(response.url).hostname.replace(/^www\./, "").toLowerCase();
@@ -69,6 +69,10 @@ const researchCompanyDomain = async (domain, signal) => {
                     if (!text)
                         sourceUrl = pageUrl;
                     text = `${text}\n${pageText}`.slice(0, 6_000);
+                }
+                if (people.size > 0 ||
+                    (0, person_extraction_1.extractTitledNames)(pageText).length > 0) {
+                    break;
                 }
             }
             catch {

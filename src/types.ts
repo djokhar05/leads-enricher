@@ -53,6 +53,9 @@ export interface LeadJobState {
   currentBatch?: number;
   currentBatchStart?: number;
   currentBatchEnd?: number;
+  currentResearchDomain?: string;
+  researchedDomains?: number;
+  totalResearchDomains?: number;
   batchSize?: number;
   stageStartedAt?: string;
   stageUpdatedAt?: string;
